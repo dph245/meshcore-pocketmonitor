@@ -8,20 +8,25 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SecondaryTabRow
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,11 +34,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun MonitorScreen(model: MonitorViewModel, onScan: () -> Unit) {
     val scan by model.scan.collectAsStateWithLifecycle()
     val connection by model.connectionStatus.collectAsStateWithLifecycle()
+    val discover by model.discover.collectAsStateWithLifecycle()
     val contacts = connection.contacts
+    val liveList = rememberLazyListState()
+    val liveState = remember(liveList) { LiveViewState(liveList) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var showContacts by remember(contacts.journalName) { mutableStateOf(false) }
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold { insets ->
@@ -67,11 +77,21 @@ internal fun MonitorScreen(model: MonitorViewModel, onScan: () -> Unit) {
                     }
                 }
                 scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-                HorizontalDivider()
-                LiveView(model, contacts, Modifier.weight(1f))
+                SecondaryTabRow(selectedTabIndex = selectedTab) {
+                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Live-Funk") })
+                    Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("DISCOVER") })
+                }
+                if (selectedTab == 0) {
+                    LiveView(model, contacts, liveState, Modifier.weight(1f))
+                } else {
+                    DiscoverView(discover, connection.discoverUnavailable, model::sendDiscover, Modifier.weight(1f))
+                }
             }
         }
-        if (showContacts) ContactOverview(contacts, model::refreshContacts) { showContacts = false }
+        if (showContacts) {
+            ContactOverview(contacts.copy(canRefresh = contacts.canRefresh && !discover.busy),
+                model::refreshContacts) { showContacts = false }
+        }
     }
 }
 

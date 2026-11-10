@@ -10,8 +10,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -48,13 +48,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
+internal class LiveViewState(val list: LazyListState) {
+    var snapshot by mutableStateOf<LiveSnapshot?>(null)
+    var follow by mutableStateOf(true)
+    var raw by mutableStateOf(false)
+}
+
 @Composable
-internal fun LiveView(model: MonitorViewModel, contacts: ContactStatus, modifier: Modifier = Modifier) {
+internal fun LiveView(
+    model: MonitorViewModel, contacts: ContactStatus, state: LiveViewState, modifier: Modifier = Modifier,
+) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val list = rememberLazyListState()
-    var snapshot by remember { mutableStateOf<LiveSnapshot?>(null) }
-    var follow by remember { mutableStateOf(true) }
-    var raw by remember { mutableStateOf(false) }
+    val list = state.list
+    val snapshot = state.snapshot
+    val follow = state.follow
+    val raw = state.raw
     var selected by remember { mutableStateOf<SelectedRow?>(null) }
 
     LaunchedEffect(model, lifecycle, follow) {
@@ -66,12 +74,12 @@ internal fun LiveView(model: MonitorViewModel, contacts: ContactStatus, modifier
                 if (journal != null && journal !== previous?.journal) {
                     val updated = withContext(Dispatchers.Default) { LiveSnapshot.update(journal, previous) }
                     if (follow && (updated.journal.fileName != previous?.journal?.fileName ||
-                            updated.firstSequence(raw) != previous.firstSequence(raw))) {
+                            updated.firstSequence(state.raw) != previous.firstSequence(state.raw))) {
                         // Apply the new head and the scroll position on the same remeasure.
                         list.requestScrollToItem(0)
                     }
                     previous = updated
-                    snapshot = updated
+                    state.snapshot = updated
                 }
                 if (!follow) break
                 delay(200)
@@ -80,7 +88,7 @@ internal fun LiveView(model: MonitorViewModel, contacts: ContactStatus, modifier
     }
     LaunchedEffect(list) {
         list.interactionSource.interactions.collect {
-            if (it is DragInteraction.Start) follow = false
+            if (it is DragInteraction.Start) state.follow = false
         }
     }
 
@@ -92,12 +100,12 @@ internal fun LiveView(model: MonitorViewModel, contacts: ContactStatus, modifier
             Text(if (raw) "Roh-RX" else "Live-Funk", style = MaterialTheme.typography.titleMedium)
             Row {
                 TextButton(onClick = {
-                    raw = !raw
+                    state.raw = !raw
                     list.requestScrollToItem(0)
                 }) { Text(if (raw) "Live" else "Rohdaten") }
                 TextButton(onClick = {
-                    follow = !follow
-                    if (follow) list.requestScrollToItem(0)
+                    state.follow = !follow
+                    if (state.follow) list.requestScrollToItem(0)
                 }) {
                     Text(if (follow) "Pause" else "Fortsetzen")
                 }

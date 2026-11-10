@@ -12,9 +12,13 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol.Command
 import de.meshcore.pocketmonitor.protocol.ContactListTransfer
+import de.meshcore.pocketmonitor.protocol.DiscoverCommandReply
+import de.meshcore.pocketmonitor.protocol.DiscoverReply
+import de.meshcore.pocketmonitor.protocol.DiscoverSearches
 import de.meshcore.pocketmonitor.protocol.PendingReply
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.RxJournal
@@ -27,6 +31,7 @@ internal data class ConnectionStatus(
     val active: Boolean = false,
     val error: Boolean = false,
     val contacts: ContactStatus = ContactStatus(),
+    val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
 )
 
 @SuppressLint("MissingPermission") // Runtime permissions come from the activity; revocation is handled below.
@@ -35,6 +40,8 @@ internal class CompanionConnection(private val context: Context) {
     private val handler = Handler(thread.looper)
     private val mutableStatus = MutableStateFlow(ConnectionStatus())
     val status = mutableStatus.asStateFlow()
+    private val searches = DiscoverSearches()
+    val discover = searches.history
 
     @Volatile
     var latestJournal: RxJournal? = null
@@ -61,6 +68,10 @@ internal class CompanionConnection(private val context: Context) {
         handler.post { current?.refreshContacts() }
     }
 
+    fun sendDiscover() {
+        handler.post { current?.sendDiscover() }
+    }
+
     fun close() {
         handler.post {
             current?.finish("Getrennt")
@@ -73,11 +84,16 @@ internal class CompanionConnection(private val context: Context) {
         val journal = RxJournal(File(context.filesDir, "rx")) { message ->
             handler.post { if (current === this) finish(message, error = true) }
         }
+        private val journalName = journal.file.name
         private var gatt: BluetoothGatt? = null
         private lateinit var rx: BluetoothGattCharacteristic
         private var mtu = 23
         private var pending: PendingReply? = null
         private var contactTransfer: ContactListTransfer? = null
+        private var firmwareVersion: Int? = null
+        private var discoverReply: DiscoverCommandReply? = null
+        private var discoverDisabled: String? = null
+        private var commandChannelUncertain = false
         private var timeout: Runnable? = null
 
         fun start() = guarded {
@@ -147,6 +163,15 @@ internal class CompanionConnection(private val context: Context) {
             gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
         ) = guarded {
             if (characteristic.uuid != CompanionProtocol.radioRx) return@guarded
+            discoverReply?.let { reply ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    reply.acknowledgeWrite()
+                    discoverProgress(reply)
+                } else {
+                    failDiscover("BLE-Schreibbestätigung fehlgeschlagen (GATT $status).", uncertain = true)
+                }
+                return@guarded
+            }
             val transfer = contactTransfer
             if (transfer != null) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -179,15 +204,24 @@ internal class CompanionConnection(private val context: Context) {
             guarded {
                 if (characteristic.uuid != CompanionProtocol.radioTx ||
                     characteristic.service.uuid != CompanionProtocol.service) return@guarded
+                val elapsedMs = SystemClock.elapsedRealtime()
                 val frame = RxFrame(System.currentTimeMillis(), value.copyOf())
                 if (!journal.offer(frame)) {
                     finish("RX-Journal konnte ein Ereignis nicht übernehmen. Empfang beendet.", error = true)
                     return@guarded
                 }
+                searches.receive(journalName, frame, elapsedMs)
+                discoverReply?.let { reply ->
+                    reply.receive(frame.bytes)
+                    discoverProgress(reply)
+                }
                 contactTransfer?.let { transfer ->
                     if (transfer.receive(frame.bytes)) contactProgress(transfer)
                 }
                 val transaction = pending ?: return@guarded
+                if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
+                    firmwareVersion = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
+                }
                 if (frame.code == CompanionProtocol.ERROR) {
                     val code = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
                     finish("Companion meldet Fehler bei ${transaction.command} (Code ${code ?: "unbekannt"}).", error = true)
@@ -207,10 +241,11 @@ internal class CompanionConnection(private val context: Context) {
                     mutableStatus.value = ConnectionStatus(
                         "Verbunden mit ${device.name} · MTU $mtu$limit", active = true,
                         contacts = ContactStatus(
-                            journalName = journal.file.name,
+                            journalName = journalName,
                             canRefresh = canLoad,
                             error = if (canLoad) null else "Kontaktliste benötigt BLE-MTU ≥ 151 (aktuell $mtu).",
                         ),
+                        discoverUnavailable = discoverUnavailable(),
                     )
                     refreshContacts()
                 }
@@ -220,7 +255,7 @@ internal class CompanionConnection(private val context: Context) {
         fun refreshContacts() = guarded {
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
-            if (!contacts.canRefresh) return@guarded
+            if (!contacts.canRefresh || searches.history.value.busy || commandChannelUncertain) return@guarded
             val transfer = ContactListTransfer()
             contactTransfer = transfer
             publishContacts(contacts.copy(canRefresh = false, loading = true, error = null))
@@ -237,7 +272,12 @@ internal class CompanionConnection(private val context: Context) {
             val result = transfer.result
             if (result != null) {
                 contactTransfer = null
-                publishContacts(mutableStatus.value.contacts.completed(result))
+                val previous = mutableStatus.value.contacts
+                val contacts = previous.completed(result)
+                if (contacts.book != previous.book) {
+                    searches.updateResolver(journalName, contacts.resolverFor(journalName))
+                }
+                publishContacts(contacts)
             } else {
                 // There is no request ID: after an idle timeout a late list could overlap a retry.
                 timeout = Runnable {
@@ -249,11 +289,77 @@ internal class CompanionConnection(private val context: Context) {
         private fun stopContactTransfer(message: String) {
             clearTimeout()
             contactTransfer = null
+            commandChannelUncertain = true
             publishContacts(mutableStatus.value.contacts.copy(canRefresh = false, loading = false, error = message))
         }
 
         private fun publishContacts(contacts: ContactStatus) {
-            mutableStatus.value = mutableStatus.value.copy(contacts = contacts)
+            mutableStatus.value = mutableStatus.value.copy(
+                contacts = contacts,
+                discoverUnavailable = discoverUnavailable(),
+            )
+        }
+
+        private fun discoverUnavailable(): String? = when {
+            commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
+            discoverDisabled != null -> discoverDisabled
+            firmwareVersion == null -> "Companion-Protokollversion für DISCOVER fehlt."
+            (firmwareVersion ?: 0) < CompanionProtocol.DISCOVER_MIN_VERSION ->
+                "DISCOVER benötigt Companion-Protokollversion 8 oder höher (aktuell $firmwareVersion)."
+            mtu < CompanionProtocol.DISCOVER_MIN_MTU ->
+                "DISCOVER benötigt BLE-MTU ≥ ${CompanionProtocol.DISCOVER_MIN_MTU} (aktuell $mtu)."
+            contactTransfer != null -> "Warte auf die Kontaktliste …"
+            else -> null
+        }
+
+        fun sendDiscover() = guarded {
+            val connection = gatt ?: return@guarded
+            val contacts = mutableStatus.value.contacts
+            if (contacts.journalName == null || discoverUnavailable() != null) return@guarded
+            val run = searches.start(
+                journalName, System.currentTimeMillis(), SystemClock.elapsedRealtime(), contacts.resolverFor(journalName),
+            ) ?: return@guarded
+            handler.postDelayed(
+                { searches.endCooldown(SystemClock.elapsedRealtime()) }, DiscoverSearches.COOLDOWN_MS,
+            )
+            discoverReply = DiscoverCommandReply()
+            timeout = Runnable {
+                failDiscover("Zeitüberschreitung bei der Companion-Bestätigung.", uncertain = true)
+            }.also { handler.postDelayed(it, DiscoverSearches.REPLY_TIMEOUT_MS) }
+            if (!write(connection, CompanionProtocol.encodeDiscover(run.tag))) {
+                failDiscover("BLE-Schreibvorgang konnte nicht gestartet werden.")
+            }
+        }
+
+        private fun discoverProgress(transaction: DiscoverCommandReply) {
+            when (val result = transaction.result) {
+                DiscoverReply.Accepted -> {
+                    clearTimeout()
+                    discoverReply = null
+                    searches.accept(SystemClock.elapsedRealtime())
+                    timeout = Runnable {
+                        clearTimeout()
+                        searches.complete()
+                    }.also { handler.postDelayed(it, DiscoverSearches.LISTEN_MS) }
+                }
+                is DiscoverReply.Rejected -> {
+                    if (result.unsupported) discoverDisabled = result.message
+                    failDiscover(result.message)
+                }
+                DiscoverReply.Malformed -> failDiscover("Ungültige Companion-Antwort.", uncertain = true)
+                null -> Unit
+            }
+        }
+
+        private fun failDiscover(message: String, uncertain: Boolean = false) {
+            clearTimeout()
+            discoverReply = null
+            if (uncertain) commandChannelUncertain = true
+            val contacts = mutableStatus.value.contacts
+            publishContacts(if (uncertain) contacts.copy(
+                canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
+            ) else contacts)
+            searches.fail(message)
         }
 
         private fun send(gatt: BluetoothGatt, command: Command) {
@@ -313,6 +419,7 @@ internal class CompanionConnection(private val context: Context) {
             if (current !== this) return
             current = null
             clearTimeout()
+            searches.disconnect(journalName, message)
             journal.close()
             gatt?.let {
                 runCatching { it.disconnect() }

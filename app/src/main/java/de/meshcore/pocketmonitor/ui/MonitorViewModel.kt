@@ -22,6 +22,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     private val mutableScan = MutableStateFlow(ScanState())
     val scan = mutableScan.asStateFlow()
     val connectionStatus = connection.status
+    val discover = connection.discover
 
     fun startScan() {
         if (connectionStatus.value.active || scan.value.scanning) return
@@ -61,6 +62,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     fun disconnect() = connection.disconnect()
 
     fun refreshContacts() = connection.refreshContacts()
+
+    fun sendDiscover() = connection.sendDiscover()
 
     fun journalSnapshot(previous: JournalSnapshot?): JournalSnapshot? = connection.latestJournal?.snapshot(previous)
 
