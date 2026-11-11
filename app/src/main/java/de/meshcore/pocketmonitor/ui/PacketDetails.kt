@@ -18,6 +18,7 @@ import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.DecodeStatus
 import de.meshcore.pocketmonitor.protocol.HopResolver
 import de.meshcore.pocketmonitor.protocol.HopStatus
+import de.meshcore.pocketmonitor.protocol.MeshPacket
 import de.meshcore.pocketmonitor.protocol.MeshPayload
 import java.time.Instant
 import java.time.ZoneId
@@ -69,7 +70,7 @@ internal fun PacketDetails(row: LiveRow, resolver: HopResolver, onDismiss: () ->
                             event?.issue != null -> "Unvollständig"
                             else -> when (packet?.status) {
                                 DecodeStatus.DECODED -> "Felder dekodiert"
-                                DecodeStatus.ENCRYPTED -> "Verschlüsselt · kein Schlüssel konfiguriert"
+                                DecodeStatus.ENCRYPTED -> "Verschlüsselt"
                                 DecodeStatus.MALFORMED -> "Fehlerhaft oder unvollständig"
                                 DecodeStatus.UNSUPPORTED -> "Format unbekannt oder nicht unterstützt"
                                 null -> UNKNOWN
@@ -82,6 +83,7 @@ internal fun PacketDetails(row: LiveRow, resolver: HopResolver, onDismiss: () ->
                         Field("Payload-Typ", header?.let { "${it.type?.name ?: UNKNOWN} (${it.typeCode.hex(1)})" } ?: UNKNOWN)
                         Field("Payload-Version", header?.let { "v${it.version}" } ?: UNKNOWN)
                         Field("Routing", header?.route?.name ?: UNKNOWN)
+                        packet?.scopeLabel()?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         if (header?.route?.hasTransportCodes == true) {
                             Field("Scope-Code", packet.transport?.scope?.hex(4) ?: UNKNOWN)
                             Field("Transportcode 2", packet.transport?.reserved?.hex(4) ?: UNKNOWN)
@@ -131,10 +133,12 @@ internal fun PacketDetails(row: LiveRow, resolver: HopResolver, onDismiss: () ->
 
 @Composable
 private fun PayloadDetails(payload: MeshPayload?) {
-    val encrypted = payload as? MeshPayload.Encrypted
+    val group = payload as? MeshPayload.GroupText
+    val encrypted = group?.encrypted ?: payload as? MeshPayload.Encrypted
     val advert = payload as? MeshPayload.Advert
     val discover = payload as? MeshPayload.Discover.Response
     val sender = when {
+        group?.sender != null -> "${group.sender} (unverifiziert)"
         advert != null -> "${advert.publicKey} (Signatur ungeprüft)"
         discover != null -> "${discover.publicKeyOrPrefix} (${if (discover.fullPublicKey) "Schlüssel" else "Präfix"}, ungeprüft)"
         encrypted?.senderKey != null -> "${encrypted.senderKey} (ungeprüft)"
@@ -152,6 +156,13 @@ private fun PayloadDetails(payload: MeshPayload?) {
         is MeshPayload.Encrypted -> {
             Field("MAC (ungeprüft)", payload.macHex)
             Field("Verschlüsselte Daten", "${payload.ciphertextSize} B")
+        }
+        is MeshPayload.GroupText -> {
+            Field("Kanal", payload.channel)
+            Field("Nachricht", payload.text)
+            Field("Nachrichtenzeit (Unix-s)", payload.timestampSeconds.toString())
+            Field("Kanaltext-Flags", payload.flags.hex(2))
+            Field("Kanal-MAC (geprüft)", payload.encrypted.macHex)
         }
         is MeshPayload.Advert -> {
             Field("Advert-Name (ungeprüft)", payload.name ?: UNKNOWN)
@@ -198,6 +209,19 @@ private fun AckDetails(ack: MeshPayload.Ack) {
 @Composable
 private fun Field(label: String, value: String) {
     Text("$label · $value", style = MaterialTheme.typography.bodySmall)
+}
+
+internal fun MeshPacket.scopeLabel(): String? {
+    val code = transport?.scope
+    return when {
+        code == null -> if (header?.route?.isDirect == false && header.route.hasTransportCodes == false)
+            "Ohne Scope" else null
+        code == 0 -> "Ohne Scope (*)"
+        code == 0xffff -> "Reservierter Scope-Code ${code.hex(4)}"
+        scopeNames.isEmpty() -> "Unbekannter Scope ${code.hex(4)}"
+        scopeNames.size == 1 -> "Scope ${scopeNames.single()}"
+        else -> "Mehrdeutiger Scope (${scopeNames.joinToString(" / ")})"
+    }
 }
 
 internal fun Int.hex(digits: Int) = toLong().hex(digits)

@@ -1,5 +1,6 @@
 package de.meshcore.pocketmonitor.ui
 
+import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.CompanionEvent
 import de.meshcore.pocketmonitor.protocol.CompanionEventDecoder
 import de.meshcore.pocketmonitor.protocol.MeshPacket
@@ -17,21 +18,24 @@ internal data class LiveRow(
 
 internal class LiveSnapshot(
     val journal: JournalSnapshot,
+    val channels: ChannelDecoding,
     val newestRadioFirst: List<LiveRow>,
 ) {
     companion object {
-        fun update(journal: JournalSnapshot, previous: LiveSnapshot?): LiveSnapshot {
-            if (journal === previous?.journal) return previous
-            val cached = previous?.takeIf { it.journal.fileName == journal.fileName }
+        fun update(journal: JournalSnapshot, previous: LiveSnapshot?, channels: ChannelDecoding = ChannelDecoding.default): LiveSnapshot {
+            if (journal === previous?.journal && channels === previous.channels) return previous
+            val cached = previous?.takeIf { it.journal.fileName == journal.fileName && it.channels === channels }
                 ?.newestRadioFirst.orEmpty().associateBy { it.original.sequence }
-            return LiveSnapshot(journal, journal.newestRadioFirst.map { cached[it.sequence] ?: decode(it) })
+            return LiveSnapshot(journal, channels, journal.newestRadioFirst.map {
+                cached[it.sequence] ?: decode(it, channels)
+            })
         }
 
-        private fun decode(row: RxRow): LiveRow {
+        private fun decode(row: RxRow, channels: ChannelDecoding): LiveRow {
             var event: CompanionEvent.RadioRx? = null
             return try {
                 event = CompanionEventDecoder.decode(row.frame.bytes) as? CompanionEvent.RadioRx
-                val packet = event?.radioBytes?.takeIf { it.isNotEmpty() }?.let(MeshPacketDecoder::decode)
+                val packet = event?.radioBytes?.takeIf { it.isNotEmpty() }?.let { MeshPacketDecoder.decode(it, channels) }
                 LiveRow(row, event, packet)
             } catch (e: CancellationException) {
                 throw e

@@ -71,8 +71,11 @@ internal fun LiveView(
             var previous = snapshot
             while (isActive) {
                 val journal = model.journalSnapshot(previous?.journal)
-                if (journal != null && journal !== previous?.journal) {
-                    val updated = withContext(Dispatchers.Default) { LiveSnapshot.update(journal, previous) }
+                val channels = journal?.let { model.channelDecoding(it.fileName) }
+                if (journal != null && channels != null &&
+                    (journal !== previous?.journal || channels !== previous.channels)
+                ) {
+                    val updated = withContext(Dispatchers.Default) { LiveSnapshot.update(journal, previous, channels) }
                     if (follow && (updated.journal.fileName != previous?.journal?.fileName ||
                             updated.firstSequence(state.raw) != previous.firstSequence(state.raw))) {
                         // Apply the new head and the scroll position on the same remeasure.
@@ -145,7 +148,11 @@ internal fun LiveView(
             }
         }
     }
-    selected?.let { PacketDetails(it.row, contacts.resolverFor(it.journalName)) { selected = null } }
+    selected?.let { selection ->
+        val updatedRow = current?.takeIf { it.journal.fileName == selection.journalName }
+            ?.newestRadioFirst?.firstOrNull { it.original.sequence == selection.row.original.sequence }
+        PacketDetails(updatedRow ?: selection.row, contacts.resolverFor(selection.journalName)) { selected = null }
+    }
 }
 
 private data class SelectedRow(val journalName: String, val row: LiveRow)
@@ -173,6 +180,12 @@ private fun RadioRow(row: LiveRow, resolver: HopResolver, onClick: () -> Unit) {
             Text(row.event?.snrDb?.let { "${it.dbText()} dB" } ?: "— dB",
                 style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace, textAlign = TextAlign.End)
         }
+        val message = packet?.payload as? MeshPayload.GroupText
+        if (message != null) {
+            Text("${message.channel} · ${message.sender ?: "Absender unbekannt"}",
+                style = MaterialTheme.typography.labelMedium)
+            Text(message.text, style = MaterialTheme.typography.bodyMedium)
+        }
         val path = packet?.path
         val summary = buildList {
             add(row.event?.radioBytes?.size?.let { "$it B" } ?: "? B")
@@ -184,7 +197,6 @@ private fun RadioRow(row: LiveRow, resolver: HopResolver, onClick: () -> Unit) {
                     else -> hops
                 })
             }
-            packet?.transport?.let { add("Scope ${it.scope.hex(4)}") }
             when (val payload = packet?.payload) {
                 is MeshPayload.Encrypted -> if (payload.channelHash != null) {
                     add("Kanal-Hash ${payload.channelHash.hex(2)}")
@@ -203,6 +215,9 @@ private fun RadioRow(row: LiveRow, resolver: HopResolver, onClick: () -> Unit) {
             }
         }.joinToString(" · ")
         Text(summary, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        packet?.takeIf { it.transport != null }?.scopeLabel()?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
         if (path != null && path.prefixes.isNotEmpty()) {
             val pathText = remember(path, resolver) {
                 resolver.resolve(path).joinToString(" → ") { hop ->

@@ -65,6 +65,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun sendDiscover() = connection.sendDiscover()
 
+    fun channelDecoding(journalName: String) = connection.channelDecoding(journalName)
+
     fun journalSnapshot(previous: JournalSnapshot?): JournalSnapshot? = connection.latestJournal?.snapshot(previous)
 
     override fun onCleared() {

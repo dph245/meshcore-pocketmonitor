@@ -41,6 +41,15 @@ internal sealed interface MeshPayload {
         val channelHash: Int? = null,
     ) : MeshPayload
 
+    data class GroupText(
+        val channel: String,
+        val sender: String?,
+        val text: String,
+        val timestampSeconds: Long,
+        val flags: Int,
+        val encrypted: Encrypted,
+    ) : MeshPayload
+
     data class Advert(
         val publicKey: String,
         val timestampSeconds: Long,
@@ -96,4 +105,5 @@ internal data class MeshPacket(
     val comparisonId: String? = null,
     val status: DecodeStatus = DecodeStatus.DECODED,
     val issue: String? = null,
+    val scopeNames: List<String> = emptyList(),
 )

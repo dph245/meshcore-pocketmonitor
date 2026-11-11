@@ -13,13 +13,19 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import de.meshcore.pocketmonitor.protocol.ChannelDecoding
+import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol.Command
 import de.meshcore.pocketmonitor.protocol.ContactListTransfer
 import de.meshcore.pocketmonitor.protocol.DiscoverCommandReply
 import de.meshcore.pocketmonitor.protocol.DiscoverReply
 import de.meshcore.pocketmonitor.protocol.DiscoverSearches
+import de.meshcore.pocketmonitor.protocol.FloodScope
 import de.meshcore.pocketmonitor.protocol.PendingReply
+import de.meshcore.pocketmonitor.protocol.PublicChannel
+import de.meshcore.pocketmonitor.protocol.TelemetryMetric
+import de.meshcore.pocketmonitor.protocol.TelemetryQuery
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.RxJournal
 import java.io.File
@@ -31,6 +37,9 @@ internal data class ConnectionStatus(
     val active: Boolean = false,
     val error: Boolean = false,
     val contacts: ContactStatus = ContactStatus(),
+    val companionReadBusy: Boolean = false,
+    val batteryMv: Int? = null,
+    val noiseFloorDbm: Int? = null,
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
 )
 
@@ -47,6 +56,12 @@ internal class CompanionConnection(private val context: Context) {
     var latestJournal: RxJournal? = null
         private set
 
+    @Volatile
+    private var channelMetadata: Pair<String, ChannelDecoding>? = null
+
+    fun channelDecoding(journalName: String): ChannelDecoding =
+        channelMetadata?.takeIf { it.first == journalName }?.second ?: ChannelDecoding.default
+
     private var current: Session? = null
 
     fun connect(device: CompanionDevice) {
@@ -54,6 +69,7 @@ internal class CompanionConnection(private val context: Context) {
             if (current == null) {
                 val session = Session(device)
                 current = session
+                channelMetadata = null
                 latestJournal = session.journal
                 session.start()
             }
@@ -91,6 +107,16 @@ internal class CompanionConnection(private val context: Context) {
         private var pending: PendingReply? = null
         private var contactTransfer: ContactListTransfer? = null
         private var firmwareVersion: Int? = null
+        private var channelSlots = 0
+        private var nextSlot = 0
+        private var scopeQueried = false
+        private var initialMetadataPending = true
+        private var channelQuery: ChannelQuery? = null
+        private val publicChannels = mutableListOf<PublicChannel>()
+        private var defaultScope: FloodScope? = null
+        private var telemetryQuery: TelemetryQuery? = null
+        private val unavailableMetrics = mutableSetOf<TelemetryMetric>()
+        private val pollTelemetry = Runnable { pollTelemetryWhenIdle() }
         private var discoverReply: DiscoverCommandReply? = null
         private var discoverDisabled: String? = null
         private var commandChannelUncertain = false
@@ -163,6 +189,24 @@ internal class CompanionConnection(private val context: Context) {
             gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
         ) = guarded {
             if (characteristic.uuid != CompanionProtocol.radioRx) return@guarded
+            channelQuery?.let { query ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    query.acknowledgeWrite()
+                    channelProgress(gatt, query)
+                } else {
+                    finishMetadata(uncertain = true)
+                }
+                return@guarded
+            }
+            telemetryQuery?.let { query ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    query.acknowledgeWrite()
+                    telemetryProgress(gatt, query)
+                } else {
+                    failTelemetry(query)
+                }
+                return@guarded
+            }
             discoverReply?.let { reply ->
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     reply.acknowledgeWrite()
@@ -211,6 +255,16 @@ internal class CompanionConnection(private val context: Context) {
                     return@guarded
                 }
                 searches.receive(journalName, frame, elapsedMs)
+                channelQuery?.let { query ->
+                    query.receive(frame.bytes)
+                    channelProgress(gatt, query)
+                    return@guarded
+                }
+                telemetryQuery?.let { query ->
+                    query.receive(frame.bytes)
+                    telemetryProgress(gatt, query)
+                    return@guarded
+                }
                 discoverReply?.let { reply ->
                     reply.receive(frame.bytes)
                     discoverProgress(reply)
@@ -221,6 +275,9 @@ internal class CompanionConnection(private val context: Context) {
                 val transaction = pending ?: return@guarded
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     firmwareVersion = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
+                    if ((firmwareVersion ?: 0) >= 3 && mtu >= ChannelQuery.CHANNEL_MTU) {
+                        channelSlots = frame.bytes.getOrNull(3)?.toInt()?.and(0xff) ?: 0
+                    }
                 }
                 if (frame.code == CompanionProtocol.ERROR) {
                     val code = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
@@ -248,6 +305,7 @@ internal class CompanionConnection(private val context: Context) {
                         discoverUnavailable = discoverUnavailable(),
                     )
                     refreshContacts()
+                    startInitialMetadata()
                 }
             }
         }
@@ -255,7 +313,10 @@ internal class CompanionConnection(private val context: Context) {
         fun refreshContacts() = guarded {
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
-            if (!contacts.canRefresh || searches.history.value.busy || commandChannelUncertain) return@guarded
+            if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null ||
+                searches.history.value.busy || commandChannelUncertain) {
+                return@guarded
+            }
             val transfer = ContactListTransfer()
             contactTransfer = transfer
             publishContacts(contacts.copy(canRefresh = false, loading = true, error = null))
@@ -278,6 +339,7 @@ internal class CompanionConnection(private val context: Context) {
                     searches.updateResolver(journalName, contacts.resolverFor(journalName))
                 }
                 publishContacts(contacts)
+                startInitialMetadata()
             } else {
                 // There is no request ID: after an idle timeout a late list could overlap a retry.
                 timeout = Runnable {
@@ -296,8 +358,124 @@ internal class CompanionConnection(private val context: Context) {
         private fun publishContacts(contacts: ContactStatus) {
             mutableStatus.value = mutableStatus.value.copy(
                 contacts = contacts,
+                companionReadBusy = channelQuery != null || telemetryQuery != null,
                 discoverUnavailable = discoverUnavailable(),
             )
+        }
+
+        private fun startInitialMetadata() {
+            val connection = gatt ?: return
+            if (!initialMetadataPending || contactTransfer != null || commandChannelUncertain) return
+            initialMetadataPending = false
+            nextMetadataQuery(connection)
+        }
+
+        private fun nextMetadataQuery(connection: BluetoothGatt) {
+            val query = when {
+                nextSlot < channelSlots -> ChannelQuery(nextSlot++)
+                !scopeQueried && mtu >= ChannelQuery.SCOPE_MTU &&
+                    (firmwareVersion ?: 0) >= ChannelQuery.SCOPE_MIN_VERSION ->
+                    ChannelQuery().also { scopeQueried = true }
+                else -> {
+                    finishMetadata()
+                    return
+                }
+            }
+            channelQuery = query
+            publishContacts(mutableStatus.value.contacts)
+            if (!write(connection, query.command)) {
+                finishMetadata()
+                return
+            }
+            timeout = Runnable { finishMetadata(uncertain = true) }
+                .also { handler.postDelayed(it, 5_000) }
+        }
+
+        private fun channelProgress(connection: BluetoothGatt, query: ChannelQuery) {
+            val frame = query.result ?: return
+            clearTimeout()
+            ChannelQuery.publicChannel(frame)?.let(publicChannels::add)
+            ChannelQuery.defaultScope(frame)?.let { defaultScope = it }
+            // A rejected slot query indicates the command or advertised slot range is unavailable.
+            if (!scopeQueried && frame.firstOrNull() != ChannelQuery.CHANNEL_INFO.toByte()) nextSlot = channelSlots
+            nextMetadataQuery(connection)
+        }
+
+        private fun finishMetadata(uncertain: Boolean = false) {
+            clearTimeout()
+            channelQuery = null
+            channelMetadata = journalName to ChannelDecoding(publicChannels, defaultScope)
+            if (uncertain) commandChannelUncertain = true
+            val contacts = mutableStatus.value.contacts
+            publishContacts(if (uncertain) contacts.copy(
+                canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
+            ) else contacts)
+            if (!uncertain) handler.post(pollTelemetry)
+        }
+
+        private fun pollTelemetryWhenIdle(): Unit = guarded {
+            val connection = gatt ?: return@guarded
+            if (commandChannelUncertain) return@guarded
+            if (contactTransfer != null || searches.history.value.busy) {
+                handler.postDelayed(pollTelemetry, 1_000)
+                return@guarded
+            }
+            nextTelemetryQuery(connection)
+        }
+
+        private fun nextTelemetryQuery(connection: BluetoothGatt, after: TelemetryMetric? = null) {
+            val metrics = TelemetryMetric.entries.filter {
+                it !in unavailableMetrics && (firmwareVersion ?: 0) >= it.minimumVersion
+            }
+            val metric = metrics.firstOrNull { after == null || it.ordinal > after.ordinal }
+            if (metric == null) {
+                telemetryQuery = null
+                publishContacts(mutableStatus.value.contacts)
+                if (metrics.isNotEmpty()) handler.postDelayed(pollTelemetry, 30_000)
+                return
+            }
+
+            val query = TelemetryQuery(metric)
+            telemetryQuery = query
+            publishContacts(mutableStatus.value.contacts)
+            if (write(connection, query.command)) {
+                timeout = Runnable { failTelemetry(query) }.also { handler.postDelayed(it, 5_000) }
+            } else {
+                // The write never started. Retry at the next regular poll.
+                publishTelemetry(query.metric, null)
+                nextTelemetryQuery(connection, query.metric)
+            }
+        }
+
+        private fun telemetryProgress(connection: BluetoothGatt, query: TelemetryQuery) {
+            val frame = query.result ?: return
+            clearTimeout()
+            val code = frame[0].toInt() and 0xff
+            if (code == CompanionProtocol.DISABLED ||
+                (code == CompanionProtocol.ERROR && frame.getOrNull(1) == 1.toByte())
+            ) {
+                unavailableMetrics += query.metric
+            }
+            publishTelemetry(query.metric, query.value(frame))
+            nextTelemetryQuery(connection, query.metric)
+        }
+
+        private fun publishTelemetry(metric: TelemetryMetric, value: Int?) {
+            val state = mutableStatus.value
+            mutableStatus.value = when (metric) {
+                TelemetryMetric.BATTERY -> state.copy(batteryMv = value)
+                TelemetryMetric.NOISE_FLOOR -> state.copy(noiseFloorDbm = value)
+            }
+        }
+
+        private fun failTelemetry(query: TelemetryQuery) {
+            clearTimeout()
+            telemetryQuery = null
+            commandChannelUncertain = true
+            publishTelemetry(query.metric, null)
+            publishContacts(mutableStatus.value.contacts.copy(
+                canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
+            ))
         }
 
         private fun discoverUnavailable(): String? = when {
@@ -309,6 +487,8 @@ internal class CompanionConnection(private val context: Context) {
             mtu < CompanionProtocol.DISCOVER_MIN_MTU ->
                 "DISCOVER benötigt BLE-MTU ≥ ${CompanionProtocol.DISCOVER_MIN_MTU} (aktuell $mtu)."
             contactTransfer != null -> "Warte auf die Kontaktliste …"
+            channelQuery != null -> "Warte auf Kanal- und Scope-Daten …"
+            telemetryQuery != null -> "Warte auf Akku- und Funkwerte …"
             else -> null
         }
 
@@ -418,6 +598,7 @@ internal class CompanionConnection(private val context: Context) {
         fun finish(message: String, error: Boolean = false) {
             if (current !== this) return
             current = null
+            handler.removeCallbacks(pollTelemetry)
             clearTimeout()
             searches.disconnect(journalName, message)
             journal.close()

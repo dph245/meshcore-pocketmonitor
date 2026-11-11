@@ -1,5 +1,6 @@
 package de.meshcore.pocketmonitor.protocol
 
+import java.nio.charset.CharacterCodingException
 import java.security.MessageDigest
 
 /** Decodes MeshCore v1 wire packets. RF metadata and journal bytes are handled separately. */
@@ -11,7 +12,7 @@ internal object MeshPacketDecoder {
     private const val MAX_ADVERT_APP_BYTES = 32
     private const val TRACE_FIXED_BYTES = 9
 
-    fun decode(bytes: ByteArray): MeshPacket {
+    fun decode(bytes: ByteArray, channels: ChannelDecoding = ChannelDecoding.default): MeshPacket {
         var packet = MeshPacket(bytes.size)
         if (bytes.isEmpty()) return packet.malformed("Funkpaket-Header fehlt.")
 
@@ -44,10 +45,14 @@ internal object MeshPacketDecoder {
         if (payloadSize !in 1..MAX_PAYLOAD_BYTES) return packet.malformed("Ungültige Payload-Länge.")
         val payload = bytes.copyOfRange(payloadStart, bytes.size)
 
+        packet.transport?.let {
+            packet = packet.copy(scopeNames = channels.scopeNames(it.scope, header.typeCode, payload))
+        }
         val decoded = when (header.type) {
             PacketType.REQ, PacketType.RESPONSE, PacketType.TXT_MSG, PacketType.PATH ->
                 encrypted(packet, payload, 2)
-            PacketType.GRP_TXT, PacketType.GRP_DATA -> encrypted(packet, payload, 1)
+            PacketType.GRP_TXT -> groupText(encrypted(packet, payload, 1), payload, channels)
+            PacketType.GRP_DATA -> encrypted(packet, payload, 1)
             PacketType.ANON_REQ -> encrypted(packet, payload, 33)
             PacketType.ADVERT -> advert(packet, payload)
             PacketType.ACK -> ack(packet, payload)
@@ -89,6 +94,29 @@ internal object MeshPacketDecoder {
         return if (cipherSize == 0 || cipherSize % CIPHER_BLOCK_BYTES != 0)
             decoded.malformed("Verschlüsselte Daten fehlen oder sind nicht blockausgerichtet.")
         else decoded
+    }
+
+    private fun groupText(packet: MeshPacket, payload: ByteArray, channels: ChannelDecoding): MeshPacket {
+        if (packet.status != DecodeStatus.ENCRYPTED) return packet
+        val encrypted = packet.payload as MeshPayload.Encrypted
+        val (channel, plain) = channels.decrypt(payload) ?: return packet
+        val flags = plain.u8(4)
+        if (flags shr 2 != 0) return packet.unsupported("Unbekannter Kanaltext-Untertyp.")
+        val end = (5 until plain.size).firstOrNull { plain[it] == 0.toByte() } ?: plain.size
+        val text = try {
+            plain.decodeToString(5, end, throwOnInvalidSequence = true)
+        } catch (_: CharacterCodingException) {
+            return packet.malformed("Kanaltext ist kein gültiges UTF-8.")
+        }
+        val separator = text.indexOf(": ")
+        val sender = if (separator > 0) text.substring(0, separator) else null
+        return packet.copy(
+            status = DecodeStatus.DECODED,
+            payload = MeshPayload.GroupText(
+                channel, sender, if (sender != null) text.substring(separator + 2) else text,
+                plain.u32(0), flags, encrypted,
+            ),
+        )
     }
 
     private fun advert(packet: MeshPacket, bytes: ByteArray): MeshPacket {
