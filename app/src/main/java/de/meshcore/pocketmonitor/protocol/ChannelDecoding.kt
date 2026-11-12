@@ -5,8 +5,17 @@ import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-internal class PublicChannel private constructor(val name: String, private val key: ByteArray) {
-    val hash = sha256(key)[0]
+internal class RadioChannel(val name: String, key: ByteArray) {
+    private val key = key.copyOf()
+    private val digest = sha256(this.key)
+    val identity = digest.toHexString()
+    val hash = digest[0]
+
+    fun forLiveDiagnostics(): RadioChannel? = when {
+        identity == builtIn.identity -> builtIn
+        name.startsWith('#') && name.length > 1 && key.contentEquals(nameKey(name)) -> this
+        else -> null
+    }
 
     fun decrypt(payload: ByteArray): ByteArray? {
         val expected = hmac(key, payload.copyOfRange(3, payload.size)).copyOf(2)
@@ -18,15 +27,7 @@ internal class PublicChannel private constructor(val name: String, private val k
 
     companion object {
         private val publicKey = "8b3387e9c5cdea6ac9e5edbaa115cd72".hexToByteArray()
-        val builtIn = PublicChannel("Public", publicKey)
-
-        fun fromSlot(name: String, key: ByteArray): PublicChannel? = when {
-            name.isEmpty() -> null
-            key.contentEquals(publicKey) -> builtIn
-            name.startsWith('#') && name.length > 1 && key.contentEquals(nameKey(name)) ->
-                PublicChannel(name, key)
-            else -> null
-        }
+        val builtIn = RadioChannel("Public", publicKey)
     }
 }
 
@@ -43,17 +44,18 @@ internal class FloodScope(val name: String, private val key: ByteArray) {
 }
 
 internal class ChannelDecoding(
-    channels: List<PublicChannel> = emptyList(),
+    channels: List<RadioChannel> = emptyList(),
     defaultScope: FloodScope? = null,
+    includeBuiltIn: Boolean = true,
 ) {
-    private val byHash = (listOf(PublicChannel.builtIn) + channels)
-        .distinctBy { it.name }.groupBy { it.hash }
+    private val byHash = (if (includeBuiltIn) listOf(RadioChannel.builtIn) + channels else channels)
+        .distinctBy { it.identity }.groupBy { it.hash }
 
     private val scopes = if (defaultScope == null) publicScopes else publicScopes + defaultScope
 
-    fun decrypt(payload: ByteArray): Pair<String, ByteArray>? {
+    fun decrypt(payload: ByteArray): Pair<RadioChannel, ByteArray>? {
         for (channel in byHash[payload[0]].orEmpty()) {
-            channel.decrypt(payload)?.let { return channel.name to it }
+            channel.decrypt(payload)?.let { return channel to it }
         }
         return null
     }

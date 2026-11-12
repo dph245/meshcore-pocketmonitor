@@ -65,6 +65,14 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun sendDiscover() = connection.sendDiscover()
 
+    fun refreshChannels() = connection.refreshChannels()
+
+    suspend fun channelHistory(previous: ChannelHistory?): ChannelHistory? {
+        val journal = connection.latestJournal ?: return null
+        val catalog = connection.channelCatalog?.takeIf { it.journalName == journal.name } ?: return null
+        return ChannelHistory.update(journal, catalog, previous)
+    }
+
     fun channelDecoding(journalName: String) = connection.channelDecoding(journalName)
 
     fun journalSnapshot(previous: JournalSnapshot?): JournalSnapshot? = connection.latestJournal?.snapshot(previous)

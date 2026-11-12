@@ -2,24 +2,35 @@ package de.meshcore.pocketmonitor.protocol
 
 import java.nio.charset.CharacterCodingException
 
-internal class ChannelQuery(slot: Int? = null) : CompanionRead(
+internal data class ChannelSlot(val index: Int, val channel: RadioChannel) {
+    fun signature() = Triple(index, channel.name, channel.identity)
+}
+
+internal class ChannelQuery(private val slot: Int? = null) : CompanionRead(
     command = if (slot == null) byteArrayOf(GET_DEFAULT_FLOOD_SCOPE) else byteArrayOf(GET_CHANNEL, slot.toByte()),
     responseCode = if (slot == null) DEFAULT_FLOOD_SCOPE else CHANNEL_INFO,
     responseSubtype = slot,
 ) {
+    fun slotReadFailed(frame: ByteArray): Boolean {
+        if (slot == null) return false
+        val missingSlot = frame.contentEquals(byteArrayOf(CompanionProtocol.ERROR.toByte(), 0x02))
+        return !missingSlot && (frame.size != CHANNEL_FRAME_SIZE || frame[0] != CHANNEL_INFO.toByte())
+    }
+
     companion object {
         private const val GET_CHANNEL: Byte = 0x1f
         private const val GET_DEFAULT_FLOOD_SCOPE: Byte = 0x40
         const val CHANNEL_INFO = 0x12
         private const val DEFAULT_FLOOD_SCOPE = 0x1c
         const val SCOPE_MIN_VERSION = 10
+        const val CHANNEL_FRAME_SIZE = 50
         const val CHANNEL_MTU = 53
         const val SCOPE_MTU = 51
 
-        fun publicChannel(frame: ByteArray): PublicChannel? {
-            if (frame.size != 50 || frame[0] != CHANNEL_INFO.toByte()) return null
-            val name = frame.name(2, 34) ?: return null
-            return PublicChannel.fromSlot(name, frame.copyOfRange(34, 50))
+        fun configuredSlot(frame: ByteArray): ChannelSlot? {
+            if (frame.size != CHANNEL_FRAME_SIZE || frame[0] != CHANNEL_INFO.toByte()) return null
+            val name = frame.name(2, 34)?.takeIf { it.isNotEmpty() } ?: return null
+            return ChannelSlot(frame[1].toInt() and 0xff, RadioChannel(name, frame.copyOfRange(34, 50)))
         }
 
         fun defaultScope(frame: ByteArray): FloodScope? {

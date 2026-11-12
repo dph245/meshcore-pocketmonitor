@@ -113,7 +113,7 @@ internal object MeshPacketDecoder {
         return packet.copy(
             status = DecodeStatus.DECODED,
             payload = MeshPayload.GroupText(
-                channel, sender, if (sender != null) text.substring(separator + 2) else text,
+                channel.name, channel.identity, sender, if (sender != null) text.substring(separator + 2) else text,
                 plain.u32(0), flags, encrypted,
             ),
         )

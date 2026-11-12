@@ -6,6 +6,7 @@ import de.meshcore.pocketmonitor.protocol.DecodeStatus
 import de.meshcore.pocketmonitor.protocol.FloodScope
 import de.meshcore.pocketmonitor.protocol.MeshPacketDecoder
 import de.meshcore.pocketmonitor.protocol.MeshPayload
+import de.meshcore.pocketmonitor.protocol.RadioChannel
 import de.meshcore.pocketmonitor.rx.JournalSnapshot
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.RxRow
@@ -31,7 +32,7 @@ class ChannelDecodingTest {
         val packet = MeshPacketDecoder.decode(publicPacket)
         assertEquals(DecodeStatus.DECODED, packet.status)
         assertEquals(
-            MeshPayload.GroupText("Public", "Jörg", "Moin: Funk! 📻", 0xf2345678, 2,
+            MeshPayload.GroupText("Public", RadioChannel.builtIn.identity, "Jörg", "Moin: Funk! 📻", 0xf2345678, 2,
                 MeshPayload.Encrypted("AC63", 32, channelHash = 0x11)),
             packet.payload,
         )
@@ -69,19 +70,19 @@ class ChannelDecodingTest {
         val row = RxRow(1, frame)
         val journal = JournalSnapshot("test", 1, listOf(row), listOf(row), null)
         val first = LiveSnapshot.update(journal, null)
-        assertEquals(DecodeStatus.ENCRYPTED, first.newestRadioFirst.single().packet?.status)
+        assertEquals(DecodeStatus.ENCRYPTED, first.radioRows.single().row.packet?.status)
 
-        val channel = requireNotNull(ChannelQuery.publicChannel(channelInfo(7, "#test256", hashtagKey)))
+        val channel = requireNotNull(ChannelQuery.configuredSlot(channelInfo(7, "#test256", hashtagKey))?.channel)
         val defaultScope = ChannelQuery.defaultScope(byteArrayOf(0x1c) + fixedName("Ort", 31) + scopeKey)
         val updated = LiveSnapshot.update(journal, first, ChannelDecoding(listOf(channel), defaultScope))
-        val packet = requireNotNull(updated.newestRadioFirst.single().packet)
+        val packet = requireNotNull(updated.radioRows.single().row.packet)
         val message = packet.payload as MeshPayload.GroupText
         assertEquals("#test256", message.channel)
         assertEquals("Olaf", message.sender)
         assertEquals("Test", message.text)
         assertEquals("Scope #Ort", packet.scopeLabel())
-        assertEquals(first.newestRadioFirst.single().packet?.comparisonId, packet.comparisonId)
-        assertSame(row, updated.newestRadioFirst.single().original)
+        assertEquals(first.radioRows.single().row.packet?.comparisonId, packet.comparisonId)
+        assertSame(row, updated.radioRows.single().row.original)
         assertArrayEquals(original, frame.bytes)
     }
 
@@ -126,11 +127,13 @@ class ChannelDecodingTest {
     }
 
     @Test
-    fun ignoresEmptyPrivateAndTruncatedSlots() {
-        assertNull(ChannelQuery.publicChannel(channelInfo(0, "", ByteArray(16))))
-        assertNull(ChannelQuery.publicChannel(channelInfo(0, "Public", hashtagKey)))
-        assertNull(ChannelQuery.publicChannel(channelInfo(0, "#test256", ByteArray(16))))
-        assertNull(ChannelQuery.publicChannel(channelInfo(0, "#test256", hashtagKey).copyOf(49)))
+    fun readsPrivateSlotsAndKeepsThemOutOfLiveDiagnostics() {
+        assertNull(ChannelQuery.configuredSlot(channelInfo(0, "", ByteArray(16))))
+        val privateSlot = requireNotNull(ChannelQuery.configuredSlot(channelInfo(7, "Public", hashtagKey)))
+        assertEquals(7, privateSlot.index)
+        assertEquals("Public", privateSlot.channel.name)
+        assertNull(privateSlot.channel.forLiveDiagnostics())
+        assertNull(ChannelQuery.configuredSlot(channelInfo(0, "#test256", hashtagKey).copyOf(49)))
     }
 
     private fun channelInfo(slot: Int, name: String, key: ByteArray) =

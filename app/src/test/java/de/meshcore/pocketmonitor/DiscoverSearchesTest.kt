@@ -186,7 +186,7 @@ class DiscoverSearchesTest {
             journal.file.readLines().drop(1).map { it.substringAfterLast('\t') })
         assertEquals(2, latest.receptions.size)
         val live = LiveSnapshot.update(journal.snapshot(null), null)
-        assertEquals(listOf(7L, 4L, 3L, 2L), live.newestRadioFirst.map { it.original.sequence })
+        assertEquals(listOf(7L, 4L, 3L, 2L), live.radioRows.map { it.row.original.sequence })
     }
 
     private fun start(journal: String = "radio", elapsed: Long = 1_000) =

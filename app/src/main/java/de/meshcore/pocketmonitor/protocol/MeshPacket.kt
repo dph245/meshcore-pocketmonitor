@@ -43,6 +43,7 @@ internal sealed interface MeshPayload {
 
     data class GroupText(
         val channel: String,
+        val channelIdentity: String,
         val sender: String?,
         val text: String,
         val timestampSeconds: Long,

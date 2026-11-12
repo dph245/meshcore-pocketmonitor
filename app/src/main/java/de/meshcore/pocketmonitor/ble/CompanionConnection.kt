@@ -23,7 +23,7 @@ import de.meshcore.pocketmonitor.protocol.DiscoverReply
 import de.meshcore.pocketmonitor.protocol.DiscoverSearches
 import de.meshcore.pocketmonitor.protocol.FloodScope
 import de.meshcore.pocketmonitor.protocol.PendingReply
-import de.meshcore.pocketmonitor.protocol.PublicChannel
+import de.meshcore.pocketmonitor.protocol.ChannelSlot
 import de.meshcore.pocketmonitor.protocol.TelemetryMetric
 import de.meshcore.pocketmonitor.protocol.TelemetryQuery
 import de.meshcore.pocketmonitor.rx.RxFrame
@@ -38,10 +38,19 @@ internal data class ConnectionStatus(
     val error: Boolean = false,
     val contacts: ContactStatus = ContactStatus(),
     val companionReadBusy: Boolean = false,
+    val channelError: String? = null,
     val batteryMv: Int? = null,
     val noiseFloorDbm: Int? = null,
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
 )
+
+internal class ChannelCatalog(
+    val journalName: String,
+    val slots: List<ChannelSlot>,
+    scope: FloodScope?,
+) {
+    val liveDecoding = ChannelDecoding(slots.mapNotNull { it.channel.forLiveDiagnostics() }, scope)
+}
 
 @SuppressLint("MissingPermission") // Runtime permissions come from the activity; revocation is handled below.
 internal class CompanionConnection(private val context: Context) {
@@ -57,10 +66,11 @@ internal class CompanionConnection(private val context: Context) {
         private set
 
     @Volatile
-    private var channelMetadata: Pair<String, ChannelDecoding>? = null
+    var channelCatalog: ChannelCatalog? = null
+        private set
 
     fun channelDecoding(journalName: String): ChannelDecoding =
-        channelMetadata?.takeIf { it.first == journalName }?.second ?: ChannelDecoding.default
+        channelCatalog?.takeIf { it.journalName == journalName }?.liveDecoding ?: ChannelDecoding.default
 
     private var current: Session? = null
 
@@ -69,7 +79,7 @@ internal class CompanionConnection(private val context: Context) {
             if (current == null) {
                 val session = Session(device)
                 current = session
-                channelMetadata = null
+                channelCatalog = null
                 latestJournal = session.journal
                 session.start()
             }
@@ -82,6 +92,10 @@ internal class CompanionConnection(private val context: Context) {
 
     fun refreshContacts() {
         handler.post { current?.refreshContacts() }
+    }
+
+    fun refreshChannels() {
+        handler.post { current?.refreshChannels() }
     }
 
     fun sendDiscover() {
@@ -112,7 +126,8 @@ internal class CompanionConnection(private val context: Context) {
         private var scopeQueried = false
         private var initialMetadataPending = true
         private var channelQuery: ChannelQuery? = null
-        private val publicChannels = mutableListOf<PublicChannel>()
+        private val configuredSlots = mutableListOf<ChannelSlot>()
+        private var channelReadFailed = false
         private var defaultScope: FloodScope? = null
         private var telemetryQuery: TelemetryQuery? = null
         private val unavailableMetrics = mutableSetOf<TelemetryMetric>()
@@ -352,6 +367,9 @@ internal class CompanionConnection(private val context: Context) {
             clearTimeout()
             contactTransfer = null
             commandChannelUncertain = true
+            if (initialMetadataPending) {
+                mutableStatus.value = mutableStatus.value.copy(channelError = "Kanalabfrage nicht möglich. Companion erneut verbinden.")
+            }
             publishContacts(mutableStatus.value.contacts.copy(canRefresh = false, loading = false, error = message))
         }
 
@@ -370,6 +388,18 @@ internal class CompanionConnection(private val context: Context) {
             nextMetadataQuery(connection)
         }
 
+        fun refreshChannels() = guarded {
+            val connection = gatt ?: return@guarded
+            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain ||
+                channelQuery != null || telemetryQuery != null || contactTransfer != null ||
+                searches.history.value.busy
+            ) return@guarded
+            configuredSlots.clear()
+            nextSlot = 0
+            channelReadFailed = false
+            nextMetadataQuery(connection)
+        }
+
         private fun nextMetadataQuery(connection: BluetoothGatt) {
             val query = when {
                 nextSlot < channelSlots -> ChannelQuery(nextSlot++)
@@ -384,6 +414,7 @@ internal class CompanionConnection(private val context: Context) {
             channelQuery = query
             publishContacts(mutableStatus.value.contacts)
             if (!write(connection, query.command)) {
+                channelReadFailed = true
                 finishMetadata()
                 return
             }
@@ -394,29 +425,39 @@ internal class CompanionConnection(private val context: Context) {
         private fun channelProgress(connection: BluetoothGatt, query: ChannelQuery) {
             val frame = query.result ?: return
             clearTimeout()
-            ChannelQuery.publicChannel(frame)?.let(publicChannels::add)
+            ChannelQuery.configuredSlot(frame)?.let(configuredSlots::add)
             ChannelQuery.defaultScope(frame)?.let { defaultScope = it }
-            // A rejected slot query indicates the command or advertised slot range is unavailable.
-            if (!scopeQueried && frame.firstOrNull() != ChannelQuery.CHANNEL_INFO.toByte()) nextSlot = channelSlots
+            if (query.slotReadFailed(frame)) channelReadFailed = true
             nextMetadataQuery(connection)
         }
 
         private fun finishMetadata(uncertain: Boolean = false) {
             clearTimeout()
             channelQuery = null
-            channelMetadata = journalName to ChannelDecoding(publicChannels, defaultScope)
+            val failed = channelReadFailed || uncertain
+            val previous = channelCatalog
+            val slots = configuredSlots.toList()
+            if (previous == null || (!failed && slots.map { it.signature() } != previous.slots.map { it.signature() })) {
+                channelCatalog = ChannelCatalog(journalName, slots, defaultScope)
+            }
+            mutableStatus.value = mutableStatus.value.copy(channelError = when {
+                uncertain -> "Kanalabfrage unterbrochen. Companion erneut verbinden."
+                failed -> "Kanalliste konnte nicht vollständig gelesen werden."
+                channelSlots == 0 -> "Dieser Companion stellt keine Kanal-Slots bereit."
+                else -> null
+            })
             if (uncertain) commandChannelUncertain = true
             val contacts = mutableStatus.value.contacts
             publishContacts(if (uncertain) contacts.copy(
                 canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
             ) else contacts)
-            if (!uncertain) handler.post(pollTelemetry)
+            if (!uncertain && previous == null) handler.post(pollTelemetry)
         }
 
         private fun pollTelemetryWhenIdle(): Unit = guarded {
             val connection = gatt ?: return@guarded
             if (commandChannelUncertain) return@guarded
-            if (contactTransfer != null || searches.history.value.busy) {
+            if (contactTransfer != null || channelQuery != null || searches.history.value.busy) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
             }

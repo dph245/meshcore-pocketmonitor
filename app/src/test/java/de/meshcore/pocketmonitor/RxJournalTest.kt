@@ -47,9 +47,10 @@ class RxJournalTest {
         assertEquals((5_000L downTo 4_501L).toList(), snapshot.newestFirst.map { it.sequence })
         assertSame(snapshot, journal.snapshot(snapshot))
         val radio = LiveSnapshot.update(snapshot, null)
-        assertEquals(500, radio.newestRadioFirst.size)
+        assertEquals(500, radio.radioRows.size)
         assertSame(radio, LiveSnapshot.update(snapshot, radio))
-        radio.newestRadioFirst.forEach { row ->
+        radio.radioRows.forEach { item ->
+            val row = item.row
             val index = (row.original.sequence - 1).toInt()
             assertArrayEquals(samples[index], row.original.frame.bytes)
             assertEquals(index.toLong(), row.original.timeMs)

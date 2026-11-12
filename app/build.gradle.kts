@@ -29,3 +29,12 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.2")
     testImplementation("junit:junit:4.13.2")
 }
+
+// Opt-in synthetic scroll fixture, installed alongside the regular app.
+if (providers.gradleProperty("scrollBenchmark").isPresent) {
+    android.buildTypes.getByName("debug").applicationIdSuffix = ".scrollbenchmark"
+    android.sourceSets.getByName("debug") {
+        java.srcDir("src/scrollBenchmark/java")
+        manifest.srcFile("src/scrollBenchmark/AndroidManifest.xml")
+    }
+}
