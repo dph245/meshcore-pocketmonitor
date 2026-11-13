@@ -62,9 +62,9 @@ Bei Flood-Paketen zeigt die App die bereits aufgezeichneten Hops. Bei Direct-Pak
 
 ### Kanäle
 
-- Der Tab **Kanäle** zeigt die belegten Slots des verbundenen Companion mit der jüngsten decodierten Nachricht als Vorschau. Ein Kanal öffnet den chronologischen Verlauf mit Absender, Nachrichtenzeit und Text. Im Tab lässt sich der Verbindungskopf einklappen.
-- Der Verlauf liest erfolgreich decodierte `GRP_TXT`-Pakete aus dem RX-Journal der aktuellen Verbindung. Auch private Slots können dort gelesen werden, wenn der Companion den passenden 128-Bit-Schlüssel liefert. Gleichnamige Kanäle mit unterschiedlichen Schlüsseln haben getrennte Verläufe. Bei einer Slotverschiebung oder Umbenennung folgt der Verlauf dem Schlüssel.
-- Die Slots werden beim Verbindungsaufbau und bei geöffnetem Kanal-Tab regelmäßig gelesen, sobald der Companion-Befehlskanal frei ist. Die Ansicht ist lesend.
+- Unter **Nachrichten** zeigt **Kanäle** die zuletzt gelesenen Slots sowie archivierte Kanäle mit Nachrichten. **Privat** zeigt private Unterhaltungen pro Companion. Beide Ansichten zeigen Absender, Senderzeit und Text und lassen sich offline lesen.
+- Beim Verbinden und nach einem Wartehinweis ruft PocketMonitor die Nachrichtenwarteschlange des Companion ab. Der Abruf entfernt die Einträge auf dem Companion. Die lokale Historie unterscheidet Abholung und Funkempfang und behält beide Quellen 30 Tage. [Protokoll, Grenzen und Dublettenabgleich](docs/message-sync.md)
+- Die Slots werden beim Verbindungsaufbau und bei geöffnetem Kanal-Tab regelmäßig gelesen, sobald der Companion-Befehlskanal frei ist. Die Nachrichtenansichten sind lesend.
 
 ### Öffentlicher Kanaltext und Scopes
 
@@ -88,11 +88,9 @@ PocketMonitor liest nach der Initialisierung und dann etwa alle 30 Sekunden die 
 
 ## RX-Journal
 
-Jeder Verbindungsversuch erzeugt `files/rx/rx-<zeit>-<uuid>.tsv` im privaten App-Speicher. Jede Zeile enthält Sequenznummer, Unix-Zeit in Millisekunden und die vollständigen Notification-Bytes als Hex. Das Journal kann bei der Debug-APK über `adb shell run-as de.meshcore.pocketmonitor ls files/rx` eingesehen werden. Unveränderte Antworten können die BLE-PIN, Positionsdaten und die vom Companion gelieferten Kanal- und Scope-Schlüssel enthalten, einschließlich Schlüsseln privater Channel-Slots. Entschlüsselter Funktext wird für die Live- und Kanalanzeige im Arbeitsspeicher berechnet.
+**Historie** öffnet bei getrennter Verbindung die gespeicherten Daten eines bekannten Companion. **Live-Funk**, **Rohdaten** und **Kanäle** zeigen gespeicherte und neu eingehende Daten aus derselben lokalen SQLite-Datenbank. Über **Ältere** und **Neuere** lässt sich der Verlauf seitenweise durchsuchen. Bei einer neuen Verbindung wählt die App nach der Identifikation automatisch den verbundenen Companion aus.
 
-Der GATT-Thread kopiert jeden Frame in eine FIFO-Warteschlange. Ein separater IO-Worker schreibt die Datei. Die Anzeige liest höchstens fünfmal pro Sekunde die letzten 500 geschriebenen Funk-Notifications beziehungsweise die letzten 500 Notifications aller Typen. Neue Funkzeilen werden im Hintergrund dekodiert. Decoderfehler bleiben auf die Anzeige beschränkt. Beim Pausieren bleibt der angezeigte Ausschnitt stehen, während BLE und Journal weiterlaufen. Bei vollem Puffer oder Schreibfehler beendet die App den Empfang mit einer sichtbaren Fehlermeldung. Beim normalen Trennen werden die bereits eingereihten Frames geschrieben. Journaldateien bleiben lokal liegen, bis die App-Daten gelöscht werden.
-
-Die App erfasst nur von Android zugestellte Notifications. Ausfälle vor dem Callback, etwa durch Firmware-Warteschlangen oder BLE-Abbrüche, lassen sich mangels Ende-zu-Ende-Sequenznummern im Funk-RX-Push nicht rekonstruieren. Die App betreibt keinen Vordergrunddienst. Eine bestehende Verbindung bleibt beim Verlassen der Activity nur erhalten, solange Android den Prozess laufen lässt.
+[Companion-Historie, Datenmodell und Aufbewahrung](docs/companion-history.md)
 
 ## Verifikation
 

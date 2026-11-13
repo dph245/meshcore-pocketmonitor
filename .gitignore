@@ -5,3 +5,7 @@
 local.properties
 *.iml
 .idea/
+
+# Local performance documentation and measurements
+/docs/scroll-performance.md
+/docs/performance-comparison/

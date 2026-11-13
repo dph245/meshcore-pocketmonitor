@@ -25,8 +25,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -39,16 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.repeatOnLifecycle
-import java.io.IOException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,42 +52,19 @@ internal fun MonitorScreen(
     val connection by model.connectionStatus.collectAsStateWithLifecycle()
     val discover by model.discover.collectAsStateWithLifecycle()
     val contacts = connection.contacts
+    val companions by model.companions.collectAsStateWithLifecycle()
+    val companion by model.selectedCompanion.collectAsStateWithLifecycle()
+    val historyReady by model.historyReady.collectAsStateWithLifecycle()
+    val historyError by model.historyError.collectAsStateWithLifecycle()
     val tabState = rememberSaveableStateHolder()
     val liveList = rememberLazyListState()
     val liveState = remember(liveList) { LiveViewState(liveList) }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var selectedDiscoverTag by rememberSaveable { mutableStateOf<Long?>(null) }
     var showContacts by remember(contacts.journalName) { mutableStateOf(false) }
     var showConnectionControls by rememberSaveable { mutableStateOf(false) }
-    val channelTabConnected = selectedTab == 2 && contacts.journalName != null
-    val history = remember { mutableStateOf<ChannelHistory?>(null) }
-    val channelContent by remember { derivedStateOf { history.value?.content } }
-    var historyError by remember(contacts.journalName) { mutableStateOf<String?>(null) }
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    LaunchedEffect(model, lifecycle, selectedTab, contacts.journalName) {
-        val journalName = contacts.journalName
-        if (history.value?.catalog?.journalName != journalName) history.value = null
-        if (selectedTab != 2 || journalName == null) return@LaunchedEffect
-        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            launch {
-                while (isActive) {
-                    model.refreshChannels()
-                    delay(30_000)
-                }
-            }
-            while (isActive) {
-                val previous = history.value
-                try {
-                    history.value = withContext(Dispatchers.IO) { model.channelHistory(previous) }
-                        ?.takeIf { it.catalog.journalName == journalName }
-                    historyError = null
-                } catch (_: IOException) {
-                    historyError = "Kanalverlauf konnte nicht aus dem RX-Journal gelesen werden."
-                }
-                delay(350)
-            }
-        }
-    }
+    val channelTabConnected = selectedTab == 2 && connection.active && contacts.journalName != null
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold { insets ->
             Column(
@@ -127,7 +93,7 @@ internal fun MonitorScreen(
                         ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
                         Button(
                             onClick = if (connection.active) model::disconnect else model::connect,
-                            enabled = connection.active || scan.selected != null,
+                            enabled = connection.active || (historyReady && scan.selected != null),
                         ) { Text(if (connection.active) "Trennen" else "Verbinden") }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -157,19 +123,45 @@ internal fun MonitorScreen(
                         Text("Display aktiv halten", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
+                if (!connection.active && companions.isNotEmpty()) {
+                    var expanded by remember { mutableStateOf(false) }
+                    Box {
+                        TextButton(onClick = { expanded = true }) {
+                            val selected = companions.firstOrNull { it.id == companion }
+                            Text(selected?.let { "Historie: ${it.name} · ${it.id.take(8)}" } ?: "Historie auswählen")
+                        }
+                        DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
+                            for (known in companions) {
+                                DropdownMenuItem(
+                                    text = { Text("${known.name} · ${known.id.take(8)}") },
+                                    onClick = { model.selectHistory(known.id); expanded = false },
+                                )
+                            }
+                        }
+                    }
+                }
+                historyError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 SecondaryTabRow(selectedTabIndex = selectedTab) {
                     Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Live-Funk") })
                     Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("DISCOVER") })
-                    Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Kanäle") })
+                    Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Nachrichten") })
                 }
                 if (selectedTab == 0) {
-                    LiveView(model, contacts, liveState, Modifier.weight(1f))
+                    LiveView(model, companion, contacts, liveState, Modifier.weight(1f))
                 } else if (selectedTab == 2) {
-                    tabState.SaveableStateProvider("channels") {
-                        ChannelView(
-                            contacts.journalName, channelContent?.takeIf { it.catalog.journalName == contacts.journalName },
-                            historyError ?: connection.channelError, Modifier.weight(1f),
-                        )
+                    SecondaryTabRow(selectedTabIndex = messageTab) {
+                        Tab(selected = messageTab == 0, onClick = { messageTab = 0 }, text = { Text("Kanäle") })
+                        Tab(selected = messageTab == 1, onClick = { messageTab = 1 }, text = { Text("Privat") })
+                    }
+                    if (connection.syncingMessages) {
+                        Text("Nachrichten werden abgeglichen …", style = MaterialTheme.typography.bodySmall)
+                    }
+                    connection.messageSyncError?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    tabState.SaveableStateProvider(if (messageTab == 0) "channels" else "private") {
+                        ChannelView(model, companion, connection.channelError.takeIf { messageTab == 0 },
+                            Modifier.weight(1f), privateMessages = messageTab == 1)
                     }
                 } else {
                     DiscoverView(

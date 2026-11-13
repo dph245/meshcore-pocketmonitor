@@ -50,18 +50,22 @@ internal class LiveSnapshot(
 
             val cached = previous?.takeIf { it.journal.fileName == journal.fileName && it.channels === channels }
             val incoming = journal.newestRadioFirst
-            val oldHead = cached?.radioRows?.firstOrNull()?.row?.original?.sequence
-            val added = oldHead?.let { sequence -> incoming.binarySearch { sequence.compareTo(it.sequence) } } ?: -1
-            // A journal's newest-first window only prepends new rows and drops rows at the tail.
+            val oldRows = cached?.radioRows.orEmpty()
+            val added = oldRows.firstOrNull()?.row?.original?.sequence?.let { sequence ->
+                incoming.binarySearch { sequence.compareTo(it.sequence) }
+            } ?: -1
             val samePresentation = cached != null && resolver === cached.resolver && zone == cached.zone
             val rows = if (incoming.isEmpty()) {
                 emptyList()
-            } else if (cached != null && samePresentation && added == 0 && incoming.size == cached.radioRows.size) {
+            } else if (cached != null && samePresentation && added == 0 && incoming.size == oldRows.size &&
+                incoming.indices.all { incoming[it].sequence == oldRows[it].row.original.sequence }) {
                 cached.radioRows
             } else {
                 val clock = radioClock(zone)
                 incoming.mapIndexed { index, original ->
-                    val old = if (added >= 0 && index >= added) cached?.radioRows?.getOrNull(index - added) else null
+                    val aligned = if (added >= 0 && index >= added) oldRows.getOrNull(index - added) else null
+                    val old = aligned?.takeIf { it.row.original.sequence == original.sequence }
+                        ?: cached?.radioRow(original.sequence)
                     when {
                         old == null -> {
                             val row = decodeRadioRow(original, channels)

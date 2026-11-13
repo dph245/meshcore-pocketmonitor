@@ -23,12 +23,18 @@ import de.meshcore.pocketmonitor.protocol.DiscoverReply
 import de.meshcore.pocketmonitor.protocol.DiscoverSearches
 import de.meshcore.pocketmonitor.protocol.FloodScope
 import de.meshcore.pocketmonitor.protocol.PendingReply
+import de.meshcore.pocketmonitor.protocol.CompanionContact
+import de.meshcore.pocketmonitor.protocol.MessageSyncStep
+import de.meshcore.pocketmonitor.protocol.QueuedMessage
 import de.meshcore.pocketmonitor.protocol.ChannelSlot
 import de.meshcore.pocketmonitor.protocol.TelemetryMetric
 import de.meshcore.pocketmonitor.protocol.TelemetryQuery
 import de.meshcore.pocketmonitor.rx.RxFrame
-import de.meshcore.pocketmonitor.rx.RxJournal
-import java.io.File
+import de.meshcore.pocketmonitor.rx.CompanionHistory
+import de.meshcore.pocketmonitor.rx.KnownCompanion
+import de.meshcore.pocketmonitor.rx.ReceptionWriter
+import java.util.UUID
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -39,6 +45,8 @@ internal data class ConnectionStatus(
     val contacts: ContactStatus = ContactStatus(),
     val companionReadBusy: Boolean = false,
     val channelError: String? = null,
+    val syncingMessages: Boolean = false,
+    val messageSyncError: String? = null,
     val batteryMv: Int? = null,
     val noiseFloorDbm: Int? = null,
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
@@ -48,12 +56,13 @@ internal class ChannelCatalog(
     val journalName: String,
     val slots: List<ChannelSlot>,
     scope: FloodScope?,
+    val complete: Boolean,
 ) {
     val liveDecoding = ChannelDecoding(slots.mapNotNull { it.channel.forLiveDiagnostics() }, scope)
 }
 
 @SuppressLint("MissingPermission") // Runtime permissions come from the activity; revocation is handled below.
-internal class CompanionConnection(private val context: Context) {
+internal class CompanionConnection(private val context: Context, private val history: CompanionHistory) {
     private val thread = HandlerThread("Companion-GATT").apply { start() }
     private val handler = Handler(thread.looper)
     private val mutableStatus = MutableStateFlow(ConnectionStatus())
@@ -61,18 +70,21 @@ internal class CompanionConnection(private val context: Context) {
     private val searches = DiscoverSearches()
     val discover = searches.history
 
+    private val mutableCompanion = MutableStateFlow<KnownCompanion?>(null)
+    val companion = mutableCompanion.asStateFlow()
+
     @Volatile
-    var latestJournal: RxJournal? = null
+    var historyError: String? = null
         private set
 
     @Volatile
-    var channelCatalog: ChannelCatalog? = null
-        private set
+    private var channelCatalog: ChannelCatalog? = null
 
-    fun channelDecoding(journalName: String): ChannelDecoding =
-        channelCatalog?.takeIf { it.journalName == journalName }?.liveDecoding ?: ChannelDecoding.default
+    fun channelDecoding(journalName: String): ChannelDecoding? =
+        channelCatalog?.takeIf { it.journalName == journalName }?.liveDecoding
 
     private var current: Session? = null
+    private var previousWriter: Job? = null
 
     fun connect(device: CompanionDevice) {
         handler.post {
@@ -80,7 +92,7 @@ internal class CompanionConnection(private val context: Context) {
                 val session = Session(device)
                 current = session
                 channelCatalog = null
-                latestJournal = session.journal
+                historyError = null
                 session.start()
             }
         }
@@ -111,10 +123,18 @@ internal class CompanionConnection(private val context: Context) {
 
     // connectGatt delivers all callbacks on this same handler.
     private inner class Session(private val device: CompanionDevice) : BluetoothGattCallback() {
-        val journal = RxJournal(File(context.filesDir, "rx")) { message ->
-            handler.post { if (current === this) finish(message, error = true) }
-        }
-        private val journalName = journal.file.name
+        private val discoverSession = UUID.randomUUID().toString()
+        private var journalName: String? = null
+        private val writer = ReceptionWriter(history, previousWriter, onIdentified = { identified ->
+            handler.post { if (current === this) mutableCompanion.value = identified }
+        }, onError = { message ->
+            handler.post {
+                if (current === this) {
+                    historyError = message
+                    finish(message, error = true)
+                }
+            }
+        })
         private var gatt: BluetoothGatt? = null
         private lateinit var rx: BluetoothGattCharacteristic
         private var mtu = 23
@@ -136,6 +156,11 @@ internal class CompanionConnection(private val context: Context) {
         private var discoverDisabled: String? = null
         private var commandChannelUncertain = false
         private var timeout: Runnable? = null
+        private var messageSync: MessageSyncStep? = null
+        private var messagesWaiting = true
+        private var initialTelemetryPending = true
+        private val resumeMessageSync = Runnable { guarded { startMessageSync() } }
+        private var contactsByPrefix = emptyMap<String, List<CompanionContact>>()
 
         fun start() = guarded {
             waitFor("Verbinde mit ${device.name} …", 20_000)
@@ -204,6 +229,15 @@ internal class CompanionConnection(private val context: Context) {
             gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
         ) = guarded {
             if (characteristic.uuid != CompanionProtocol.radioRx) return@guarded
+            messageSync?.let { step ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    step.acknowledgeWrite()
+                    messageSyncProgress(step)
+                } else {
+                    endMessageSync("BLE-Schreibbestätigung fehlgeschlagen", uncertain = true)
+                }
+                return@guarded
+            }
             channelQuery?.let { query ->
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     query.acknowledgeWrite()
@@ -265,11 +299,36 @@ internal class CompanionConnection(private val context: Context) {
                     characteristic.service.uuid != CompanionProtocol.service) return@guarded
                 val elapsedMs = SystemClock.elapsedRealtime()
                 val frame = RxFrame(System.currentTimeMillis(), value.copyOf())
-                if (!journal.offer(frame)) {
+                val step = messageSync
+                val queueEntry = step?.receive(frame.bytes) ?: QueuedMessage.isQueueEntry(frame.code)
+                if (queueEntry) {
+                    // A reply may arrive after a timeout while the GATT connection is still open.
+                    val accepted = writer.offerQueued(frame, configuredSlots.toList(), contactsByPrefix) {
+                        if (step != null) handler.post {
+                            guarded {
+                                if (messageSync === step) {
+                                    step.entryCommitted()
+                                    messageSyncProgress(step)
+                                }
+                            }
+                        }
+                    }
+                    if (!accepted) finish("Nachricht konnte nicht ins RX-Journal übernommen werden.", error = true)
+                    return@guarded
+                }
+                if (!writer.offer(frame)) {
                     finish("RX-Journal konnte ein Ereignis nicht übernehmen. Empfang beendet.", error = true)
                     return@guarded
                 }
-                searches.receive(journalName, frame, elapsedMs)
+                searches.receive(discoverSession, frame, elapsedMs)
+                if (frame.code == QueuedMessage.WAITING && frame.bytes.size == 1) {
+                    messagesWaiting = true
+                    handler.post(resumeMessageSync)
+                }
+                if (step != null) {
+                    messageSyncProgress(step)
+                    return@guarded
+                }
                 channelQuery?.let { query ->
                     query.receive(frame.bytes)
                     channelProgress(gatt, query)
@@ -288,6 +347,16 @@ internal class CompanionConnection(private val context: Context) {
                     if (transfer.receive(frame.bytes)) contactProgress(transfer)
                 }
                 val transaction = pending ?: return@guarded
+                if (transaction.command == Command.APP_START && frame.code == Command.APP_START.expectedReply &&
+                    journalName == null
+                ) {
+                    val identity = CompanionProtocol.selfIdentity(frame.bytes)
+                    if (identity == null || !writer.identify(KnownCompanion(identity, device.name))) {
+                        finish("Companion hat keine gültige MeshCore-Identität geliefert.", error = true)
+                        return@guarded
+                    }
+                    journalName = identity
+                }
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     firmwareVersion = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
                     if ((firmwareVersion ?: 0) >= 3 && mtu >= ChannelQuery.CHANNEL_MTU) {
@@ -328,7 +397,7 @@ internal class CompanionConnection(private val context: Context) {
         fun refreshContacts() = guarded {
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
-            if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null ||
+            if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null || messageSync != null ||
                 searches.history.value.busy || commandChannelUncertain) {
                 return@guarded
             }
@@ -351,10 +420,12 @@ internal class CompanionConnection(private val context: Context) {
                 val previous = mutableStatus.value.contacts
                 val contacts = previous.completed(result)
                 if (contacts.book != previous.book) {
-                    searches.updateResolver(journalName, contacts.resolverFor(journalName))
+                    contactsByPrefix = contacts.book?.list?.contacts.orEmpty().groupBy { it.publicKey.take(12) }
+                    journalName?.let { searches.updateResolver(discoverSession, contacts.resolverFor(it)) }
                 }
                 publishContacts(contacts)
                 startInitialMetadata()
+                handler.post(resumeMessageSync)
             } else {
                 // There is no request ID: after an idle timeout a late list could overlap a retry.
                 timeout = Runnable {
@@ -368,7 +439,10 @@ internal class CompanionConnection(private val context: Context) {
             contactTransfer = null
             commandChannelUncertain = true
             if (initialMetadataPending) {
-                mutableStatus.value = mutableStatus.value.copy(channelError = "Kanalabfrage nicht möglich. Companion erneut verbinden.")
+                mutableStatus.value = mutableStatus.value.copy(
+                    channelError = "Kanalabfrage nicht möglich. Companion erneut verbinden.",
+                    messageSyncError = "Nachrichtenabgleich nicht gestartet. Companion erneut verbinden.",
+                )
             }
             publishContacts(mutableStatus.value.contacts.copy(canRefresh = false, loading = false, error = message))
         }
@@ -376,7 +450,7 @@ internal class CompanionConnection(private val context: Context) {
         private fun publishContacts(contacts: ContactStatus) {
             mutableStatus.value = mutableStatus.value.copy(
                 contacts = contacts,
-                companionReadBusy = channelQuery != null || telemetryQuery != null,
+                companionReadBusy = channelQuery != null || telemetryQuery != null || messageSync != null,
                 discoverUnavailable = discoverUnavailable(),
             )
         }
@@ -391,7 +465,7 @@ internal class CompanionConnection(private val context: Context) {
         fun refreshChannels() = guarded {
             val connection = gatt ?: return@guarded
             if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain ||
-                channelQuery != null || telemetryQuery != null || contactTransfer != null ||
+                channelQuery != null || telemetryQuery != null || contactTransfer != null || messageSync != null ||
                 searches.history.value.busy
             ) return@guarded
             configuredSlots.clear()
@@ -436,9 +510,18 @@ internal class CompanionConnection(private val context: Context) {
             channelQuery = null
             val failed = channelReadFailed || uncertain
             val previous = channelCatalog
+            val id = journalName ?: return
             val slots = configuredSlots.toList()
-            if (previous == null || (!failed && slots.map { it.signature() } != previous.slots.map { it.signature() })) {
-                channelCatalog = ChannelCatalog(journalName, slots, defaultScope)
+            val changed = previous == null || (!failed && !previous.complete) ||
+                slots.map { it.signature() } != previous.slots.map { it.signature() }
+            if (previous == null || (!failed && changed)) {
+                channelCatalog = ChannelCatalog(id, slots, defaultScope, !failed)
+            }
+            if (changed && (slots.isNotEmpty() || (!failed && channelSlots > 0))) {
+                if (!writer.configure(slots, complete = !failed)) {
+                    finish("Kanal-Konfiguration konnte nicht gespeichert werden.", error = true)
+                    return
+                }
             }
             mutableStatus.value = mutableStatus.value.copy(channelError = when {
                 uncertain -> "Kanalabfrage unterbrochen. Companion erneut verbinden."
@@ -446,18 +529,104 @@ internal class CompanionConnection(private val context: Context) {
                 channelSlots == 0 -> "Dieser Companion stellt keine Kanal-Slots bereit."
                 else -> null
             })
-            if (uncertain) commandChannelUncertain = true
+            if (uncertain) {
+                commandChannelUncertain = true
+                if (messagesWaiting) mutableStatus.value = mutableStatus.value.copy(
+                    messageSyncError = "Nachrichtenabgleich ausstehend. Companion erneut verbinden.",
+                )
+            }
             val contacts = mutableStatus.value.contacts
             publishContacts(if (uncertain) contacts.copy(
                 canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
             ) else contacts)
-            if (!uncertain && previous == null) handler.post(pollTelemetry)
+            if (!uncertain && initialTelemetryPending) handler.post(pollTelemetry)
+            else startMessageSync()
+        }
+
+        private fun startMessageSync() {
+            val connection = gatt ?: return
+            if (initialTelemetryPending || !messagesWaiting || messageSync != null || !mutableStatus.value.active || initialMetadataPending ||
+                channelQuery != null || contactTransfer != null || telemetryQuery != null ||
+                searches.history.value.busy || commandChannelUncertain
+            ) return
+            if (mtu < CompanionProtocol.FULL_FRAME_MTU) {
+                messagesWaiting = false
+                mutableStatus.value = mutableStatus.value.copy(
+                    messageSyncError = "Nachrichtenabruf benötigt BLE-MTU ≥ ${CompanionProtocol.FULL_FRAME_MTU}.",
+                )
+                return
+            }
+            nextMessage(connection)
+        }
+
+        private fun nextMessage(connection: BluetoothGatt) {
+            messagesWaiting = false
+            messageSync = MessageSyncStep()
+            if (!mutableStatus.value.syncingMessages) {
+                mutableStatus.value = mutableStatus.value.copy(syncingMessages = true, messageSyncError = null)
+                publishContacts(mutableStatus.value.contacts)
+            }
+            val step = checkNotNull(messageSync)
+            if (!write(connection, byteArrayOf(QueuedMessage.NEXT.toByte()))) {
+                endMessageSync("BLE-Schreibvorgang konnte nicht gestartet werden")
+                return
+            }
+            timeout = Runnable {
+                val reason = when {
+                    !step.writeComplete -> "BLE-Schreibbestätigung fehlt"
+                    step.receivedReply -> "SQLite-Bestätigung fehlt"
+                    else -> "Zeitüberschreitung bei der Companion-Antwort"
+                }
+                // Queue replies use distinct codes. After a confirmed GATT write, a missing
+                // reply must not disable telemetry. Do not immediately repeat a dequeue.
+                endMessageSync(reason, uncertain = !step.writeComplete)
+            }.also { handler.postDelayed(it, 10_000) }
+        }
+
+        private fun messageSyncProgress(step: MessageSyncStep) {
+            if (timeout == null) return
+            when (step.result) {
+                MessageSyncStep.Result.NEXT -> {
+                    clearTimeout()
+                    // Some BLE UART implementations drain multiple writes as one frame.
+                    // Give the peripheral a connection interval before sending another command.
+                    handler.postDelayed({
+                        guarded { if (messageSync === step) gatt?.let(::nextMessage) }
+                    }, 100)
+                }
+                MessageSyncStep.Result.EMPTY -> {
+                    val repeat = messagesWaiting
+                    endMessageSync()
+                    if (repeat) {
+                        messagesWaiting = true
+                        startMessageSync()
+                    }
+                }
+                MessageSyncStep.Result.REJECTED -> endMessageSync("Companion hat den Abruf abgelehnt")
+                MessageSyncStep.Result.MALFORMED -> endMessageSync("Ungültige Companion-Antwort", uncertain = true)
+                null -> Unit
+            }
+        }
+
+        private fun endMessageSync(reason: String? = null, uncertain: Boolean = false) {
+            clearTimeout()
+            messageSync = null
+            messagesWaiting = false
+            if (uncertain) commandChannelUncertain = true
+            val state = mutableStatus.value
+            mutableStatus.value = state.copy(
+                syncingMessages = false,
+                messageSyncError = reason?.let { "Nachrichtenabgleich unterbrochen. $it. Companion erneut verbinden." },
+            )
+            publishContacts(if (uncertain) state.contacts.copy(canRefresh = false) else state.contacts)
         }
 
         private fun pollTelemetryWhenIdle(): Unit = guarded {
             val connection = gatt ?: return@guarded
             if (commandChannelUncertain) return@guarded
-            if (contactTransfer != null || channelQuery != null || searches.history.value.busy) {
+            if (contactTransfer != null || channelQuery != null || messageSync != null || telemetryQuery != null ||
+                searches.history.value.busy
+            ) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
             }
@@ -471,8 +640,10 @@ internal class CompanionConnection(private val context: Context) {
             val metric = metrics.firstOrNull { after == null || it.ordinal > after.ordinal }
             if (metric == null) {
                 telemetryQuery = null
+                initialTelemetryPending = false
                 publishContacts(mutableStatus.value.contacts)
                 if (metrics.isNotEmpty()) handler.postDelayed(pollTelemetry, 30_000)
+                handler.postDelayed(resumeMessageSync, 100)
                 return
             }
 
@@ -530,15 +701,17 @@ internal class CompanionConnection(private val context: Context) {
             contactTransfer != null -> "Warte auf die Kontaktliste …"
             channelQuery != null -> "Warte auf Kanal- und Scope-Daten …"
             telemetryQuery != null -> "Warte auf Akku- und Funkwerte …"
+            messageSync != null -> "Nachrichten werden abgeglichen …"
             else -> null
         }
 
         fun sendDiscover() = guarded {
             val connection = gatt ?: return@guarded
             val contacts = mutableStatus.value.contacts
+            val journalName = journalName ?: return@guarded
             if (contacts.journalName == null || discoverUnavailable() != null) return@guarded
             val run = searches.start(
-                journalName, System.currentTimeMillis(), SystemClock.elapsedRealtime(), contacts.resolverFor(journalName),
+                discoverSession, System.currentTimeMillis(), SystemClock.elapsedRealtime(), contacts.resolverFor(journalName),
             ) ?: return@guarded
             handler.postDelayed(
                 { searches.endCooldown(SystemClock.elapsedRealtime()) }, DiscoverSearches.COOLDOWN_MS,
@@ -561,6 +734,7 @@ internal class CompanionConnection(private val context: Context) {
                     timeout = Runnable {
                         clearTimeout()
                         searches.complete()
+                        startMessageSync()
                     }.also { handler.postDelayed(it, DiscoverSearches.LISTEN_MS) }
                 }
                 is DiscoverReply.Rejected -> {
@@ -581,6 +755,7 @@ internal class CompanionConnection(private val context: Context) {
                 canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
             ) else contacts)
             searches.fail(message)
+            handler.post(resumeMessageSync)
         }
 
         private fun send(gatt: BluetoothGatt, command: Command) {
@@ -640,15 +815,22 @@ internal class CompanionConnection(private val context: Context) {
             if (current !== this) return
             current = null
             handler.removeCallbacks(pollTelemetry)
+            handler.removeCallbacks(resumeMessageSync)
             clearTimeout()
-            searches.disconnect(journalName, message)
-            journal.close()
+            searches.disconnect(discoverSession, message)
+            writer.close()
+            previousWriter = writer.completion
+            channelCatalog = null
             gatt?.let {
                 runCatching { it.disconnect() }
                 runCatching { it.close() }
             }
             gatt = null
-            mutableStatus.value = ConnectionStatus(message, error = error)
+            val state = mutableStatus.value
+            val syncError = if (state.syncingMessages || (state.active && messagesWaiting)) {
+                "Nachrichtenabgleich unterbrochen. Beim nächsten Verbinden wird die restliche Warteschlange abgerufen."
+            } else state.messageSyncError
+            mutableStatus.value = ConnectionStatus(message, error = error, messageSyncError = syncError)
         }
     }
 }

@@ -1,5 +1,6 @@
 package de.meshcore.pocketmonitor.ui
 
+import android.database.sqlite.SQLiteException
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -56,31 +57,47 @@ internal class LiveViewState(val list: LazyListState) {
     var snapshot by mutableStateOf<LiveSnapshot?>(null)
     var follow by mutableStateOf(true)
     var raw by mutableStateOf(false)
+    var pages by mutableStateOf(listOf<Long?>(null))
 }
 
 @Composable
 internal fun LiveView(
-    model: MonitorViewModel, contacts: ContactStatus, state: LiveViewState, modifier: Modifier = Modifier,
+    model: MonitorViewModel, companion: String?, contacts: ContactStatus, state: LiveViewState, modifier: Modifier = Modifier,
 ) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val list = state.list
-    val snapshot = state.snapshot
+    val snapshot = state.snapshot?.takeIf { it.journal.fileName == companion }
     val follow = state.follow
     val raw = state.raw
-    var selected by remember { mutableStateOf<SelectedRow?>(null) }
+    val before = state.pages.last()
+    var error by remember(companion) { mutableStateOf<String?>(null) }
+    var selected by remember(companion) { mutableStateOf<SelectedRow?>(null) }
 
     val latestContacts by rememberUpdatedState(contacts)
     val resolver = contacts.resolverFor(snapshot?.journal?.fileName)
-    LaunchedEffect(model, lifecycle, follow) {
-        if (!follow && snapshot != null) return@LaunchedEffect
+    LaunchedEffect(companion) {
+        if (state.snapshot?.journal?.fileName != companion) {
+            state.pages = listOf(null)
+            state.snapshot = null
+            state.follow = true
+            list.requestScrollToItem(0)
+        }
+    }
+    LaunchedEffect(model, lifecycle, companion, before, follow) {
+        if (companion == null || (!follow && snapshot != null && snapshot.journal.before == before)) return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             var previous = state.snapshot
             while (isActive) {
                 val contactStatus = latestContacts
-                val updated = withContext(Dispatchers.Default) {
-                    val journal = model.journalSnapshot(previous?.journal) ?: return@withContext null
-                    val channels = model.channelDecoding(journal.fileName)
-                    LiveSnapshot.update(journal, previous, channels, contactStatus.resolverFor(journal.fileName))
+                val updated = try {
+                    withContext(Dispatchers.IO) {
+                        val journal = model.journalSnapshot(companion, previous?.journal, before)
+                        val channels = model.channelDecoding(companion)
+                        LiveSnapshot.update(journal, previous, channels, contactStatus.resolverFor(companion))
+                    }.also { error = null }
+                } catch (_: SQLiteException) {
+                    error = "RX-Historie konnte nicht gelesen werden."
+                    null
                 }
                 if (updated != null && updated !== previous) {
                     if (state.follow && !list.isScrollInProgress && !list.isAwayFromHead() &&
@@ -126,11 +143,15 @@ internal fun LiveView(
             Row {
                 TextButton(onClick = {
                     state.raw = !raw
+                    state.pages = listOf(null)
                     list.requestScrollToItem(0)
                 }) { Text(if (raw) "Live" else "Rohdaten") }
                 TextButton(onClick = {
                     state.follow = !follow
-                    if (state.follow) list.requestScrollToItem(0)
+                    if (state.follow) {
+                        state.pages = listOf(null)
+                        list.requestScrollToItem(0)
+                    }
                 }) {
                     Text(if (follow) "Pause" else "Fortsetzen")
                 }
@@ -143,7 +164,7 @@ internal fun LiveView(
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(bottom = 4.dp),
         )
-        current?.journal?.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        (error ?: current?.journal?.error)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         if (current == null || current.firstSequence(raw) == null) {
             Text(
                 if (raw) "Noch keine Companion-Notifications." else "Noch keine Funkpakete (0x88).",
@@ -151,13 +172,40 @@ internal fun LiveView(
             )
         } else {
             val journalName = current.journal.fileName
-            LiveRows(current, raw, list) { selected = SelectedRow(journalName, it) }
+            Column(Modifier.weight(1f)) {
+                LiveRows(current, raw, list) { selected = SelectedRow(journalName, it) }
+            }
+        }
+        val page = current?.journal?.takeIf { it.before == before }
+        val older = if (raw) page?.hasOlderRaw == true else page?.hasOlderRadio == true
+        if (older || before != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (before != null) TextButton(onClick = {
+                    state.pages = state.pages.dropLast(1)
+                    list.requestScrollToItem(0)
+                }) { Text("Neuere") }
+                if (older) TextButton(onClick = {
+                    val tail = if (raw) page?.newestFirst?.lastOrNull() else page?.newestRadioFirst?.lastOrNull()
+                    if (tail != null) {
+                        state.follow = false
+                        state.pages = state.pages + tail.sequence
+                        list.requestScrollToItem(0)
+                    }
+                }) { Text("Ältere") }
+            }
         }
     }
     selected?.let { selection ->
         val updatedRow = current?.takeIf { it.journal.fileName == selection.journalName }
             ?.radioRow(selection.row.original.sequence)?.row
-        PacketDetails(updatedRow ?: selection.row, contacts.resolverFor(selection.journalName)) { selected = null }
+        var decoded by remember(selection) { mutableStateOf(selection.row) }
+        LaunchedEffect(selection, updatedRow) {
+            if (updatedRow == null && selection.row.event == null && selection.row.original.code == CompanionProtocol.RF_LOG) {
+                val channels = current?.channels ?: return@LaunchedEffect
+                decoded = withContext(Dispatchers.Default) { decodeRadioRow(selection.row.original, channels) }
+            }
+        }
+        PacketDetails(updatedRow ?: decoded, contacts.resolverFor(selection.journalName)) { selected = null }
     }
 }
 
@@ -170,9 +218,9 @@ internal fun LiveRows(
             items(current.journal.newestFirst, key = { "raw-${current.journal.fileName}-${it.sequence}" }) { row ->
                 RawRow(row) {
                     val liveRow = if (row.code == CompanionProtocol.RF_LOG) {
-                        current.radioRow(row.sequence)?.row
+                        current.radioRow(row.sequence)?.row ?: LiveRow(row, null, null)
                     } else LiveRow(row, null, null)
-                    liveRow?.let(onSelect)
+                    onSelect(liveRow)
                 }
                 HorizontalDivider()
             }

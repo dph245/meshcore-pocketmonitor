@@ -18,6 +18,12 @@ internal object CompanionProtocol {
     const val DISABLED = 0x0f
     const val CONTACT_FRAME_MTU = 151 // 148-byte contact frame + ATT header.
     const val RF_LOG = 0x88
+    const val PRIVATE_KEY_REPLY = 0x0e
+
+    fun selfIdentity(frame: ByteArray): String? {
+        if (frame.size < 36 || frame[0].toInt() != Command.APP_START.expectedReply) return null
+        return frame.toHexString(4, 36).takeUnless { key -> key.all { it == '0' } }
+    }
     private const val SEND_CONTROL_DATA = 0x37
     const val DISCOVER_MIN_VERSION = 8
     const val DISCOVER_MIN_MTU = 46 // 38-byte payload + 2 RF header + 3 RX log + 3 ATT.

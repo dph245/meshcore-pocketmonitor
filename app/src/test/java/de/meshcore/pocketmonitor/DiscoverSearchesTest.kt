@@ -6,22 +6,18 @@ import de.meshcore.pocketmonitor.protocol.DiscoverSearches
 import de.meshcore.pocketmonitor.protocol.HopResolver
 import de.meshcore.pocketmonitor.protocol.HopStatus
 import de.meshcore.pocketmonitor.rx.RxFrame
-import de.meshcore.pocketmonitor.rx.RxJournal
+import de.meshcore.pocketmonitor.rx.JournalSnapshot
+import de.meshcore.pocketmonitor.rx.RxRow
+import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.ui.LiveSnapshot
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Rule
 import org.junit.Test
-import org.junit.rules.TemporaryFolder
 
 class DiscoverSearchesTest {
-    @get:Rule val temp = TemporaryFolder()
-
     private val key = "1020304050607080" + "AB".repeat(24)
     private val keyWithSamePrefix = key.take(16) + "CD".repeat(24)
     private var tag = 0u
@@ -167,25 +163,22 @@ class DiscoverSearchesTest {
     }
 
     @Test
-    fun discoverProcessingKeepsEveryNotificationAndUnmatchedRepliesInLiveView() = runBlocking {
-        val journal = RxJournal(temp.root) { throw AssertionError(it) }
-        val run = start(journal.file.name)
+    fun discoverProcessingKeepsUnmatchedRepliesInLiveView() {
+        val run = start()
         searches.accept(1_000)
         val matching = response(run.tag).bytes
         val unmatched = response(run.tag + 1u).bytes
         val samples = listOf("00".hexToByteArray(), matching, matching, unmatched,
             "8e0f89".hexToByteArray(), "0103".hexToByteArray(), "88ff".hexToByteArray(), byteArrayOf())
-        samples.forEachIndexed { index, bytes ->
+        val rows = samples.mapIndexed { index, bytes ->
             val frame = RxFrame(index.toLong(), bytes)
-            assertTrue(journal.offer(frame))
-            searches.receive(journal.file.name, frame, 1_100L + index)
-        }
-        journal.close()
-        withTimeout(10_000) { journal.completion.join() }
-        assertEquals(samples.map { it.toHexString(HexFormat.UpperCase) },
-            journal.file.readLines().drop(1).map { it.substringAfterLast('\t') })
+            searches.receive("radio", frame, 1_100L + index)
+            RxRow(index + 1L, frame)
+        }.asReversed()
         assertEquals(2, latest.receptions.size)
-        val live = LiveSnapshot.update(journal.snapshot(null), null)
+        val snapshot = JournalSnapshot("radio", rows.size.toLong(), rows,
+            rows.filter { it.code == CompanionProtocol.RF_LOG }, null)
+        val live = LiveSnapshot.update(snapshot, null)
         assertEquals(listOf(7L, 4L, 3L, 2L), live.radioRows.map { it.row.original.sequence })
     }
 

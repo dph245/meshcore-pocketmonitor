@@ -34,48 +34,87 @@ import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
+import de.meshcore.pocketmonitor.rx.HistoryChannel
+import de.meshcore.pocketmonitor.rx.HistoryPage
+import de.meshcore.pocketmonitor.rx.MessageCursor
+import android.database.sqlite.SQLiteException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 
 @Composable
 internal fun ChannelView(
-    journalName: String?,
-    history: ChannelContent?,
-    error: String?,
+    model: MonitorViewModel,
+    companion: String?,
+    connectionError: String?,
     modifier: Modifier = Modifier,
+    privateMessages: Boolean = false,
 ) {
-    var selectedSlot by rememberSaveable(journalName) { mutableStateOf<Int?>(null) }
-    var selectedIdentity by rememberSaveable(journalName) { mutableStateOf<String?>(null) }
-    val conversationState = key(journalName) { rememberSaveableStateHolder() }
-    val slots = history?.catalog?.slots.orEmpty()
-    val selection = selectedSlot?.let { slot -> selectedIdentity?.let { ChannelSelection(slot, it) } }
-    val channel = selection?.resolve(slots)
-    val closeConversation = {
-        selectedSlot = null
-        selectedIdentity = null
+    var selectedIdentity by rememberSaveable(companion) { mutableStateOf<String?>(null) }
+    val conversationState = key(companion) { rememberSaveableStateHolder() }
+    var previews by remember(companion) { mutableStateOf<List<ChannelPreview>?>(null) }
+    var error by remember(companion) { mutableStateOf<String?>(null) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(model, lifecycle, companion, selectedIdentity) {
+        if (companion == null) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var revision = -1L
+            var nextRefresh = 0L
+            while (isActive) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (!privateMessages && now >= nextRefresh) {
+                    model.refreshChannels()
+                    nextRefresh = now + 30_000
+                }
+                val current = model.historyRevision
+                if (revision != current) {
+                    try {
+                        val updated = withContext(Dispatchers.IO) {
+                            model.historyChannels(companion, privateMessages).map { channel ->
+                                val last = if (selectedIdentity == null) {
+                                    model.channelMessages(companion, channel.identity, null, 1).rows.lastOrNull()
+                                } else null
+                                ChannelPreview(channel, last)
+                            }
+                        }
+                        previews = updated
+                        revision = current
+                        error = null
+                    } catch (_: SQLiteException) {
+                        error = "Nachrichtenverlauf konnte nicht gelesen werden."
+                    }
+                }
+                delay(350)
+            }
+        }
     }
-    LaunchedEffect(history?.catalog, selection) {
-        if (history != null && channel == null) closeConversation()
+    val channels = previews.orEmpty()
+    val channel = channels.firstOrNull { it.channel.identity == selectedIdentity }?.channel
+    val closeConversation = { selectedIdentity = null }
+    LaunchedEffect(previews, selectedIdentity) {
+        if (previews != null && channel == null) closeConversation()
     }
     BackHandler(enabled = channel != null, onBack = closeConversation)
     Column(modifier) {
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        (error ?: connectionError)?.let {
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
         when {
-            journalName == null -> Text("Companion verbinden, um Kanäle anzuzeigen.")
-            channel != null && history != null -> conversationState.SaveableStateProvider("$journalName/${channel.channel.identity}") {
-                ChannelConversation(
-                    channel.channel.name,
-                    history.messagesFor(channel),
-                    closeConversation,
-                    Modifier.weight(1f),
-                )
+            companion == null -> Text("Companion verbinden, um Nachrichten anzuzeigen.")
+            channel != null -> conversationState.SaveableStateProvider("$companion/${channel.identity}") {
+                PagedConversation(model, companion, channel, closeConversation, Modifier.weight(1f), privateMessages)
             }
-            slots.isNotEmpty() && history != null -> LazyColumn {
-                items(slots, key = { it.index }) { slot ->
-                    val last = history.messagesFor(slot).lastOrNull()
+            channels.isNotEmpty() -> LazyColumn {
+                items(channels, key = { it.channel.identity }) { (item, last) ->
                     Column(
                         Modifier.fillMaxWidth().clickable {
-                            selectedSlot = slot.index
-                            selectedIdentity = slot.channel.identity
+                            selectedIdentity = item.identity
                         }.padding(horizontal = 4.dp, vertical = 10.dp),
                     ) {
                         Row(
@@ -83,10 +122,15 @@ internal fun ChannelView(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text(slot.channel.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
+                            Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (slots.count { it.channel.name == slot.channel.name } > 1) {
-                                Text("Slot ${slot.index}", style = MaterialTheme.typography.labelSmall)
+                            when {
+                                privateMessages && channels.count { it.channel.name == item.name } > 1 ->
+                                    Text(item.identity.substringAfterLast(':').take(12), style = MaterialTheme.typography.labelSmall)
+                                privateMessages -> Unit
+                                item.slot == null && !item.identity.startsWith("slot:") -> Text("Archiv · ${item.identity.take(8)}", style = MaterialTheme.typography.labelSmall)
+                                item.slot != null && channels.count { it.channel.name == item.name } > 1 ->
+                                    Text("Slot ${item.slot}", style = MaterialTheme.typography.labelSmall)
                             }
                         }
                         Text(
@@ -100,7 +144,69 @@ internal fun ChannelView(
                     HorizontalDivider()
                 }
             }
-            error == null -> Text(if (history == null) "Lese Kanäle vom Companion …" else "Keine Kanäle konfiguriert.")
+            else -> Text(when {
+                previews == null -> "Lese Nachrichten …"
+                privateMessages -> "Keine privaten Unterhaltungen."
+                else -> "Keine Kanäle verfügbar."
+            })
+        }
+    }
+}
+
+private data class ChannelPreview(val channel: HistoryChannel, val last: ChannelMessage?)
+
+@Composable
+private fun PagedConversation(
+    model: MonitorViewModel, companion: String, channel: HistoryChannel, onBack: () -> Unit, modifier: Modifier,
+    privateMessages: Boolean,
+) {
+    // Keep only one page of messages, plus the keys needed to navigate back.
+    var boundaries by remember { mutableStateOf(listOf<MessageCursor?>(null)) }
+    val before = boundaries.last()
+    var page by remember { mutableStateOf<HistoryPage<ChannelMessage>?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val list = rememberLazyListState()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(model, lifecycle, companion, channel.identity, before) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var revision = -1L
+            while (isActive) {
+                val current = model.historyRevision
+                if (revision != current) {
+                    try {
+                        val updated = withContext(Dispatchers.IO) {
+                            model.channelMessages(companion, channel.identity, before, CHAT_PAGE_SIZE)
+                        }
+                        if (updated != page) page = updated
+                        error = null
+                        revision = current
+                    } catch (_: SQLiteException) {
+                        error = "Nachrichten konnten nicht gelesen werden."
+                    }
+                }
+                delay(350)
+            }
+        }
+    }
+    Column(modifier) {
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        ChannelConversation(channel.name, page?.rows.orEmpty(), onBack, Modifier.weight(1f), list,
+            backLabel = if (privateMessages) "‹ Privat" else "‹ Kanäle")
+        if (page?.hasOlder == true || before != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (before != null) TextButton(onClick = {
+                    boundaries = boundaries.dropLast(1)
+                    page = null
+                    list.requestScrollToItem(0)
+                }) { Text("Neuere") }
+                if (page?.hasOlder == true) TextButton(onClick = {
+                    page?.rows?.firstOrNull()?.let {
+                        boundaries = boundaries + MessageCursor(it.timestampSeconds, it.sequence)
+                        page = null
+                        list.requestScrollToItem(0)
+                    }
+                }) { Text("Ältere") }
+            }
         }
     }
 }
@@ -112,6 +218,7 @@ internal fun ChannelConversation(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     list: LazyListState = rememberLazyListState(),
+    backLabel: String = "‹ Kanäle",
 ) {
     var displayed by remember { mutableStateOf(messages, referentialEqualityPolicy()) }
     LaunchedEffect(messages, list) {
@@ -131,12 +238,12 @@ internal fun ChannelConversation(
     }
     Column(modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("‹ Kanäle") }
+            TextButton(onClick = onBack) { Text(backLabel) }
             Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (displayed.isEmpty()) {
-            Text("Noch keine Nachrichten in diesem Kanal.", Modifier.weight(1f))
+            Text("Noch keine Nachrichten in dieser Unterhaltung.", Modifier.weight(1f))
         } else {
             val newestFirst = displayed.asReversed()
             val typography = MaterialTheme.typography

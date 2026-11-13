@@ -108,12 +108,11 @@ internal object MeshPacketDecoder {
         } catch (_: CharacterCodingException) {
             return packet.malformed("Kanaltext ist kein gültiges UTF-8.")
         }
-        val separator = text.indexOf(": ")
-        val sender = if (separator > 0) text.substring(0, separator) else null
+        val (sender, body) = splitChannelText(text)
         return packet.copy(
             status = DecodeStatus.DECODED,
             payload = MeshPayload.GroupText(
-                channel.name, channel.identity, sender, if (sender != null) text.substring(separator + 2) else text,
+                channel.name, channel.identity, sender, body,
                 plain.u32(0), flags, encrypted,
             ),
         )

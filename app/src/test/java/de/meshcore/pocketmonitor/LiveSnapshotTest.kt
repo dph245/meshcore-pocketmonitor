@@ -47,6 +47,16 @@ class LiveSnapshotTest {
         assertEquals("01:00:00", timeZone.radioRow(1)?.display?.time)
     }
 
+    @Test
+    fun retentionAndPagingCannotReuseTheWrongPacket() {
+        val initial = LiveSnapshot.update(snapshot(6, listOf(row(6), row(5), row(4), row(3))), null)
+        val pruned = LiveSnapshot.update(snapshot(5, listOf(row(7), row(6), row(4), row(3))), initial)
+        assertEquals(listOf(7L, 6L, 4L, 3L), pruned.radioRows.map { it.row.original.sequence })
+        assertSame(initial.radioRow(4), pruned.radioRow(4))
+        val older = LiveSnapshot.update(snapshot(5, listOf(row(2), row(1))), pruned)
+        assertEquals(listOf(2L, 1L), older.radioRows.map { it.row.original.sequence })
+    }
+
     private fun row(sequence: Long) = RxRow(sequence, RxFrame(0, byteArrayOf(0x88.toByte())))
 
     private fun snapshot(count: Long, rows: List<RxRow>) = JournalSnapshot("rx", count, rows, rows, null)
