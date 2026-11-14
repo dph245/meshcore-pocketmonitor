@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.ChannelSlot
@@ -94,11 +95,47 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         }
     }
 
+    fun beginGroup(companion: String, channel: HistoryChannel, text: String, now: Long, scope: String,
+                   digest: (Long) -> String?): Pair<Long, Long> {
+        val database = db
+        val group = GroupHistory(database)
+        val send = database.inTransaction {
+            insertChannel(database, companion, channel)
+            val wireTime = group.wireTime(companion, now)
+            group.begin(companion, channel, text, now, wireTime, scope, digest(wireTime)) to wireTime
+        }
+        changes.incrementAndGet()
+        return send
+    }
+
+    fun updateGroup(id: Long, status: GroupSendStatus) {
+        GroupHistory(db).update(id, status)
+        changes.incrementAndGet()
+    }
+
+    fun groupScope(companion: String, channel: String) = GroupHistory(db).scope(companion, channel)
+
+    fun groupScopeDirty(companion: String): Boolean =
+        db.rawQuery("SELECT group_scope_dirty FROM companion WHERE id = ?", arrayOf(companion))
+            .use { it.moveToFirst() && it.getInt(0) != 0 }
+
+    fun setGroupScopeDirty(companion: String, dirty: Boolean) {
+        db.execSQL("UPDATE companion SET group_scope_dirty = ? WHERE id = ?",
+            arrayOf<Any>(if (dirty) 1 else 0, companion))
+    }
+
+    fun groupRepeats(id: Long) = GroupHistory(db).repeats(id)
+
+    fun saveGroupRepeaters(companion: String, contacts: List<CompanionContact>) =
+        GroupHistory(db).saveRepeaters(companion, contacts)
+
+    fun groupRepeaterNames(companion: String) = GroupHistory(db).repeaterNames(companion)
+
     fun append(companion: String, session: String, frames: List<Received>, decoding: ChannelDecoding) {
         val decoded = frames.map { decodeMessage(it.frame, decoding) }
         val database = db
         val inserted = database.inTransaction {
-            insertBatch(database, companion, session, frames, decoded)
+            insertBatch(database, companion, session, frames, decoded, trackRepeats = true)
         }
         if (inserted) changes.incrementAndGet()
     }
@@ -119,6 +156,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         db.rawQuery("""
             SELECT id, received_at, frame FROM rx
             WHERE companion = ? AND code = ${CompanionProtocol.RF_LOG} AND id > ? AND id <= ? AND message_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)
             ORDER BY id LIMIT 128
         """, arrayOf(companion, after.toString(), through.toString())).use { it.collect(::readRx) }
 
@@ -157,14 +195,21 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         }
         val clock = channelClock()
         val rows = db.rawQuery("""
-            SELECT id, sender, sent_at, body, comparison, receptions, synchronized_count FROM message
-            WHERE companion = ? AND channel = ? $boundary
+            SELECT id, sender, sent_at, body, comparison, receptions, synchronized_count,
+                group_send.scope, group_send.status, group_send.channel_name, group_send.created_at,
+                CASE WHEN group_send.message_id IS NOT NULL THEN
+                    (SELECT count(*) FROM group_repeat WHERE send_id = message.id)
+                END
+            FROM message LEFT JOIN group_send ON group_send.message_id = message.id
+            WHERE message.companion = ? AND channel = ? $boundary
             ORDER BY sent_at DESC, id DESC LIMIT ${limit + 1}
         """, args.toTypedArray()).use { cursor ->
             cursor.collect {
                 val time = getLong(2)
                 ChannelMessage(getLong(0), getString(1), time, getString(3), clock.format(Instant.ofEpochSecond(time)),
-                    getString(4), getLong(5), getLong(6) > 0)
+                    getString(4), getLong(5), getLong(6) > 0,
+                    if (isNull(7)) null else OutgoingGroup(getString(7), GroupSendStatus.valueOf(getString(8)),
+                        getLong(11), getString(9), getLong(10)))
             }
         }
         return HistoryPage(rows.take(limit).asReversed(), rows.size > limit)
@@ -185,6 +230,9 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 if (deleted < 2000) break
             }
         }
+        val expired = database.delete("message", "id IN (SELECT message_id FROM group_send WHERE created_at < ?)",
+            arrayOf((now - HISTORY_AGE_MS).toString()))
+        if (expired > 0) changes.incrementAndGet()
         database.execSQL("""
             DELETE FROM channel WHERE slot IS NULL AND NOT EXISTS (
                 SELECT 1 FROM message WHERE message.companion = channel.companion AND message.channel = channel.identity
@@ -241,7 +289,8 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     private fun insertBatch(database: SQLiteDatabase, companion: String, session: String,
                             frames: List<Received>, decoded: List<DecodedMessage?>,
-                            linkQueued: ((Long) -> Unit)? = null): Boolean {
+                            trackRepeats: Boolean = false, linkQueued: ((Long) -> Unit)? = null): Boolean {
+        val group = GroupHistory(database).takeIf { trackRepeats }
         var inserted = false
         database.compileStatement("""
             INSERT OR IGNORE INTO rx(companion, session, ordinal, received_at, code, frame) VALUES (?, ?, ?, ?, ?, ?)
@@ -256,7 +305,9 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 val id = statement.executeInsert()
                 if (id == -1L) continue
                 inserted = true
-                decoded[index]?.let { link(database, companion, id, it) }
+                if (group?.linkRepeat(companion, id, item.frame) != true) {
+                    decoded[index]?.let { link(database, companion, id, it) }
+                }
                 linkQueued?.invoke(id)
             }
         }
@@ -271,7 +322,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     private fun link(database: SQLiteDatabase, companion: String, id: Long, message: DecodedMessage) {
         val payload = message.payload
         // A concurrent retention pass or decode may already have handled this reception.
-        val pending = database.rawQuery("SELECT 1 FROM rx WHERE id = ? AND companion = ? AND message_id IS NULL",
+        val pending = database.rawQuery("SELECT 1 FROM rx WHERE id = ? AND companion = ? AND message_id IS NULL AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)",
             arrayOf(id.toString(), companion)).use { it.moveToFirst() }
         if (!pending) return
         val channel = HistoryChannel(payload.channelIdentity, payload.channel, null)
@@ -326,7 +377,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         val args = listOf(companion, channel.identity, time.toString(), body) + listOfNotNull(sender)
         return database.rawQuery("""
             SELECT id FROM message WHERE companion = ? AND channel = ? AND sent_at = ? AND body = ?
-            AND $senderCondition ORDER BY id LIMIT 1
+            AND $senderCondition AND comparison NOT LIKE 'tx:%' ORDER BY id LIMIT 1
         """, args.toTypedArray()).use { if (it.moveToFirst()) it.getLong(0) else null }
     }
 

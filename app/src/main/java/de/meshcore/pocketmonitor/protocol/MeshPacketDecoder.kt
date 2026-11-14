@@ -71,7 +71,13 @@ internal object MeshPacketDecoder {
             hash.update(pathLength.toByte())
             hash.update(0.toByte())
         }
-        return decoded.copy(comparisonId = hash.digest(payload).hex(0, 8))
+        val digest = hash.digest(payload)
+        return decoded.copy(
+            comparisonId = digest.hex(0, 8),
+            repeatDigest = if (header.type == PacketType.GRP_TXT && !header.route.isDirect &&
+                (decoded.status == DecodeStatus.DECODED || decoded.status == DecodeStatus.ENCRYPTED) && count > 0
+            ) digest.toHexString() else null,
+        )
     }
 
     private fun encrypted(packet: MeshPacket, bytes: ByteArray, macOffset: Int): MeshPacket {

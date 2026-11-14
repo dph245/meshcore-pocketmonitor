@@ -3,6 +3,11 @@ package de.meshcore.pocketmonitor
 import android.app.Activity
 import android.app.Instrumentation
 import android.os.Bundle
+import de.meshcore.pocketmonitor.protocol.GroupSend
+import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.protocol.HopResolver
+import de.meshcore.pocketmonitor.protocol.HopStatus
+import de.meshcore.pocketmonitor.rx.HistoryChannel
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelSlot
 import de.meshcore.pocketmonitor.protocol.CompanionContact
@@ -56,8 +61,9 @@ class HistoryInstrumentation : Instrumentation() {
                     verifyLegacyImport(history, legacy)
                 }
                 verifyMessageSync()
+                verifyGroupSend()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private messages and paging\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private messages, group send, repeats, migration and paging\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -208,6 +214,91 @@ class HistoryInstrumentation : Instrumentation() {
                 })
                 history.prune(now + HISTORY_AGE_MS + 1)
                 check(history.channels(id, private = true).isEmpty() && history.channels(id).isEmpty())
+            }
+        } finally {
+            targetContext.deleteDatabase(file)
+        }
+    }
+
+    private fun verifyGroupSend() {
+        val file = "group-test-${UUID.randomUUID()}.db"
+        val channel = HistoryChannel(public.identity, public.name, 0)
+        val text = "Grüße 📻"
+        val name = "Pocket".encodeToByteArray()
+        fun digest(seconds: Long) = GroupSend.repeatDigest(public, seconds, name, text.encodeToByteArray())
+        fun repeatFrame(seconds: Long, path: String): ByteArray =
+            path.hexToByteArray() + public.encryptGroupText(GroupSend.timestamp(seconds) +
+                byteArrayOf(0) + name + ": $text".encodeToByteArray())
+
+        try {
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                history.register(id, "Companion", now)
+                history.append(id, "original", listOf(Received(1, RxFrame(now, publicFrame))), ChannelDecoding.default)
+
+                // Retain populated v2 tables and triggers while removing the v3 schema.
+                val db = helper.writableDatabase
+                db.execSQL("DROP TABLE group_repeat")
+                db.execSQL("DROP TABLE group_send")
+                db.execSQL("DROP TABLE group_scope")
+                db.execSQL("DROP TABLE group_repeater")
+                db.execSQL("ALTER TABLE companion DROP COLUMN group_wire_time")
+                db.execSQL("ALTER TABLE companion DROP COLUMN group_scope_dirty")
+                db.version = 2
+            }
+            val firstId = HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                check(history.messages(id, public.identity, null).rows.single().outgoing == null)
+                history.register(other, "Companion", now)
+                val (first, wireTime) = history.beginGroup(id, channel, text, now, "#de", ::digest)
+                check(history.messages(id, public.identity, null).rows.single { it.sequence == first }.outgoing?.status == GroupSendStatus.UNKNOWN)
+                history.setGroupScopeDirty(id, true)
+                val repeat = repeatFrame(wireTime, "88f49c15012a")
+                val multihop = repeatFrame(wireTime, "8800b014785600000211fe")
+                val direct = repeatFrame(wireTime, "8800b01500")
+                val input = listOf(repeat, repeat, multihop, direct).mapIndexed { index, bytes ->
+                    Received(index + 1L, RxFrame(now + index + 1, bytes))
+                }
+                repeat(2) { history.append(id, "rf", input, ChannelDecoding.default) }
+                history.append(other, "elsewhere", input.take(1), ChannelDecoding.default)
+                history.append(id, "late", listOf(Received(1, RxFrame(now + 120_001, repeat))), ChannelDecoding.default)
+                history.updateGroup(first, GroupSendStatus.ACCEPTED)
+                val (second, nextWireTime) = history.beginGroup(id, channel, text, now, GroupSend.DEFAULT, ::digest)
+                check(second != first && nextWireTime == wireTime + 1)
+                val retransmission = repeatFrame(nextWireTime, "88f49c15012a")
+                history.append(id, "resend", listOf(Received(1, RxFrame(now + 8, retransmission))), ChannelDecoding.default)
+                check(history.groupRepeats(second).size == 1)
+                history.updateGroup(second, GroupSendStatus.REJECTED)
+                check(history.groupRepeats(second).isEmpty())
+                check(history.groupScope(other, public.identity) == null)
+                val events = history.groupRepeats(first)
+                check(events.map { it.prefix } == listOf("2A", "2A", "FE"))
+                check(events.first().row.frame.bytes.contentEquals(repeat))
+                val node = CompanionContact("2A" + "11".repeat(31), "Repeater", CompanionContact.TYPE_REPEATER,
+                    0, 0, "", 0, 0.0, 0.0, 0)
+                history.saveGroupRepeaters(id, listOf(node))
+                check(HopResolver(listOf(node)).resolve(events[0].prefix).status == HopStatus.UNIQUE)
+                check(HopResolver(listOf(node, node.copy(publicKey = "2A" + "22".repeat(31))))
+                    .resolve(events[0].prefix).status == HopStatus.AMBIGUOUS)
+                check(HopResolver(listOf(node)).resolve(events[2].prefix).status == HopStatus.UNKNOWN)
+                first
+            }
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                check(history.groupScope(id, public.identity) == GroupSend.DEFAULT)
+                check(history.groupScopeDirty(id) && !history.groupScopeDirty(other))
+                check(history.groupRepeaterNames(id).values.single() == "Repeater")
+                check(history.groupRepeaterNames(other).isEmpty())
+                val message = history.messages(id, public.identity, null).rows.single { it.sequence == firstId }
+                check(message.text == text && message.outgoing?.let {
+                    it.scope == "#de" && it.repeats == 3L && it.status == GroupSendStatus.ACCEPTED
+                } == true)
+                history.prune(now + HISTORY_AGE_MS)
+                check(history.groupRepeats(firstId).size == 3)
+                history.prune(now + HISTORY_AGE_MS + 1)
+                check(history.messages(id, public.identity, null).rows.none { it.outgoing != null })
+                check(history.groupRepeats(firstId).isEmpty())
+                check(history.journal(id, null, null, null).newestFirst.any { it.timeMs == now + 1 })
             }
         } finally {
             targetContext.deleteDatabase(file)

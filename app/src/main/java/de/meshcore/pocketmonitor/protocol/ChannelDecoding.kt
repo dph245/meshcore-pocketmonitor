@@ -17,6 +17,14 @@ internal class RadioChannel(val name: String, key: ByteArray) {
         else -> null
     }
 
+    fun encryptGroupText(plaintext: ByteArray): ByteArray {
+        val padded = plaintext.copyOf((plaintext.size + 15) / 16 * 16)
+        val ciphertext = Cipher.getInstance("AES/ECB/NoPadding").apply {
+            init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"))
+        }.doFinal(padded)
+        return byteArrayOf(hash) + hmac(key, ciphertext).copyOf(2) + ciphertext
+    }
+
     fun decrypt(payload: ByteArray): ByteArray? {
         val expected = hmac(key, payload.copyOfRange(3, payload.size)).copyOf(2)
         if (!MessageDigest.isEqual(expected, payload.copyOfRange(1, 3))) return null
@@ -45,7 +53,8 @@ internal class FloodScope(val name: String, private val key: ByteArray) {
     }
 
     companion object {
-        fun public(name: String) = FloodScope(name, nameKey(name))
+        fun public(name: String) = FloodScope(name, namedKey(name))
+        fun namedKey(name: String) = nameKey(name)
     }
 }
 
@@ -53,11 +62,16 @@ internal class ChannelDecoding(
     channels: List<RadioChannel> = emptyList(),
     defaultScope: FloodScope? = null,
     includeBuiltIn: Boolean = true,
+    diagnoseScope: Boolean = true,
 ) {
     private val byHash = (if (includeBuiltIn) listOf(RadioChannel.builtIn) + channels else channels)
         .distinctBy { it.identity }.groupBy { it.hash }
 
-    private val scopes = if (defaultScope == null) publicScopes else publicScopes + defaultScope
+    private val scopes = when {
+        !diagnoseScope -> emptyList()
+        defaultScope == null -> publicScopes
+        else -> publicScopes + defaultScope
+    }
 
     fun decrypt(payload: ByteArray): Pair<RadioChannel, ByteArray>? {
         for (channel in byHash[payload[0]].orEmpty()) {
@@ -73,10 +87,11 @@ internal class ChannelDecoding(
 
     companion object {
         // Public regions also recognized by MeshCore OnAir. Other names can come from the Companion.
-        private val publicScopes = listOf(
+        val publicScopeNames = listOf(
             "#de", "#de-ni", "#de-ni-wf", "#bsmesh", "#de-mitte", "#de-nord", "#de-harz",
             "#de-ni-h", "#de-ni-hi", "#de-ni-he", "#de-ni-wob", "#elm-asse", "#de-st",
-        ).map(FloodScope::public)
+        )
+        private val publicScopes = publicScopeNames.map(FloodScope::public)
 
         val default = ChannelDecoding()
     }

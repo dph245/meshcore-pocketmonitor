@@ -106,5 +106,6 @@ internal data class MeshPacket(
     val comparisonId: String? = null,
     val status: DecodeStatus = DecodeStatus.DECODED,
     val issue: String? = null,
+    val repeatDigest: String? = null,
     val scopeNames: List<String> = emptyList(),
 )

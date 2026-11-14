@@ -64,7 +64,7 @@ Bei Flood-Paketen zeigt die App die bereits aufgezeichneten Hops. Bei Direct-Pak
 
 - Unter **Nachrichten** zeigt **Kanäle** die zuletzt gelesenen Slots sowie archivierte Kanäle mit Nachrichten. **Privat** zeigt private Unterhaltungen pro Companion. Beide Ansichten zeigen Absender, Senderzeit und Text und lassen sich offline lesen.
 - Beim Verbinden und nach einem Wartehinweis ruft PocketMonitor die Nachrichtenwarteschlange des Companion ab. Der Abruf entfernt die Einträge auf dem Companion. Die lokale Historie unterscheidet Abholung und Funkempfang und behält beide Quellen 30 Tage. [Protokoll, Grenzen und Dublettenabgleich](docs/message-sync.md)
-- Die Slots werden beim Verbindungsaufbau und bei geöffnetem Kanal-Tab regelmäßig gelesen, sobald der Companion-Befehlskanal frei ist. Die Nachrichtenansichten sind lesend.
+- Die Slots werden beim Verbindungsaufbau und bei geöffnetem Kanal-Tab regelmäßig gelesen, sobald der Companion-Befehlskanal frei ist. In einem aktiven Kanal lässt sich Text über den Companion senden. Scope-Auswahl, Sendestatus und lokale Repeat-Beobachtung sind unter [Group-TX](docs/group-tx.md) beschrieben.
 
 ### Öffentlicher Kanaltext und Scopes
 

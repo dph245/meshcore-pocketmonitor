@@ -9,13 +9,17 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
+import android.database.sqlite.SQLiteException
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import de.meshcore.pocketmonitor.protocol.GroupSend
+import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
+import de.meshcore.pocketmonitor.protocol.CompanionRead
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol.Command
 import de.meshcore.pocketmonitor.protocol.ContactListTransfer
 import de.meshcore.pocketmonitor.protocol.DiscoverCommandReply
@@ -32,6 +36,7 @@ import de.meshcore.pocketmonitor.protocol.TelemetryQuery
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.KnownCompanion
+import de.meshcore.pocketmonitor.rx.HistoryChannel
 import de.meshcore.pocketmonitor.rx.ReceptionWriter
 import java.util.UUID
 import kotlinx.coroutines.Job
@@ -52,6 +57,29 @@ internal data class ConnectionStatus(
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
 )
 
+internal data class GroupSender(
+    val session: String,
+    val companion: String,
+    val channels: Set<String>,
+    val scopes: List<String>,
+    val maxBytes: Int,
+    val busy: Boolean,
+)
+
+private enum class GroupStage { PREPARE, SEND, RESTORE }
+
+private class GroupTransaction(
+    val id: Long,
+    val scope: String,
+    val command: ByteArray,
+    val completed: (String?) -> Unit,
+) {
+    var stage = GroupStage.PREPARE
+    lateinit var reply: CompanionRead
+    var status = GroupSendStatus.FAILED
+    var error: String? = null
+}
+
 internal class ChannelCatalog(
     val journalName: String,
     val slots: List<ChannelSlot>,
@@ -67,6 +95,8 @@ internal class CompanionConnection(private val context: Context, private val his
     private val handler = Handler(thread.looper)
     private val mutableStatus = MutableStateFlow(ConnectionStatus())
     val status = mutableStatus.asStateFlow()
+    private val mutableGroupSender = MutableStateFlow<GroupSender?>(null)
+    val groupSender = mutableGroupSender.asStateFlow()
     private val searches = DiscoverSearches()
     val discover = searches.history
 
@@ -114,6 +144,15 @@ internal class CompanionConnection(private val context: Context, private val his
         handler.post { current?.sendDiscover() }
     }
 
+    fun sendGroup(session: String, companion: String, channel: String, text: String, scope: String,
+                  completed: (String?) -> Unit) {
+        handler.post {
+            val connection = current
+            if (connection == null) completed("Companion ist nicht verbunden.")
+            else connection.sendGroup(session, companion, channel, text, scope, completed)
+        }
+    }
+
     fun close() {
         handler.post {
             current?.finish("Getrennt")
@@ -125,6 +164,9 @@ internal class CompanionConnection(private val context: Context, private val his
     private inner class Session(private val device: CompanionDevice) : BluetoothGattCallback() {
         private val discoverSession = UUID.randomUUID().toString()
         private var journalName: String? = null
+        private var selfName: ByteArray? = null
+        private var group: GroupTransaction? = null
+        private var groupBlocked = false
         private val writer = ReceptionWriter(history, previousWriter, onIdentified = { identified ->
             handler.post { if (current === this) mutableCompanion.value = identified }
         }, onError = { message ->
@@ -229,6 +271,15 @@ internal class CompanionConnection(private val context: Context, private val his
             gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
         ) = guarded {
             if (characteristic.uuid != CompanionProtocol.radioRx) return@guarded
+            group?.let { tx ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    tx.reply.acknowledgeWrite()
+                    groupProgress(gatt, tx)
+                } else {
+                    finishGroup(tx, "BLE-Schreibbestätigung fehlgeschlagen.", uncertain = true)
+                }
+                return@guarded
+            }
             messageSync?.let { step ->
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     step.acknowledgeWrite()
@@ -325,6 +376,11 @@ internal class CompanionConnection(private val context: Context, private val his
                     messagesWaiting = true
                     handler.post(resumeMessageSync)
                 }
+                group?.let { tx ->
+                    tx.reply.receive(frame.bytes)
+                    groupProgress(gatt, tx)
+                    return@guarded
+                }
                 if (step != null) {
                     messageSyncProgress(step)
                     return@guarded
@@ -356,6 +412,7 @@ internal class CompanionConnection(private val context: Context, private val his
                         return@guarded
                     }
                     journalName = identity
+                    selfName = GroupSend.selfName(frame.bytes)
                 }
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     firmwareVersion = frame.bytes.getOrNull(1)?.toInt()?.and(0xff)
@@ -398,7 +455,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
             if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null || messageSync != null ||
-                searches.history.value.busy || commandChannelUncertain) {
+                searches.history.value.busy || group != null || commandChannelUncertain) {
                 return@guarded
             }
             val transfer = ContactListTransfer()
@@ -420,6 +477,10 @@ internal class CompanionConnection(private val context: Context, private val his
                 val previous = mutableStatus.value.contacts
                 val contacts = previous.completed(result)
                 if (contacts.book != previous.book) {
+                    if (!writer.contacts(contacts.book?.list?.contacts.orEmpty())) {
+                        finish("Kontakte konnten nicht in der Historie gespeichert werden.", error = true)
+                        return
+                    }
                     contactsByPrefix = contacts.book?.list?.contacts.orEmpty().groupBy { it.publicKey.take(12) }
                     journalName?.let { searches.updateResolver(discoverSession, contacts.resolverFor(it)) }
                 }
@@ -448,6 +509,7 @@ internal class CompanionConnection(private val context: Context, private val his
         }
 
         private fun publishContacts(contacts: ContactStatus) {
+            publishGroupSender()
             mutableStatus.value = mutableStatus.value.copy(
                 contacts = contacts,
                 companionReadBusy = channelQuery != null || telemetryQuery != null || messageSync != null,
@@ -464,7 +526,7 @@ internal class CompanionConnection(private val context: Context, private val his
 
         fun refreshChannels() = guarded {
             val connection = gatt ?: return@guarded
-            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain ||
+            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain || group != null ||
                 channelQuery != null || telemetryQuery != null || contactTransfer != null || messageSync != null ||
                 searches.history.value.busy
             ) return@guarded
@@ -511,6 +573,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val failed = channelReadFailed || uncertain
             val previous = channelCatalog
             val id = journalName ?: return
+            groupBlocked = failed
             val slots = configuredSlots.toList()
             val changed = previous == null || (!failed && !previous.complete) ||
                 slots.map { it.signature() } != previous.slots.map { it.signature() }
@@ -547,7 +610,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return
             if (initialTelemetryPending || !messagesWaiting || messageSync != null || !mutableStatus.value.active || initialMetadataPending ||
                 channelQuery != null || contactTransfer != null || telemetryQuery != null ||
-                searches.history.value.busy || commandChannelUncertain
+                searches.history.value.busy || group != null || commandChannelUncertain
             ) return
             if (mtu < CompanionProtocol.FULL_FRAME_MTU) {
                 messagesWaiting = false
@@ -625,7 +688,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return@guarded
             if (commandChannelUncertain) return@guarded
             if (contactTransfer != null || channelQuery != null || messageSync != null || telemetryQuery != null ||
-                searches.history.value.busy
+                searches.history.value.busy || group != null
             ) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
@@ -690,8 +753,152 @@ internal class CompanionConnection(private val context: Context, private val his
             ))
         }
 
+        private fun publishGroupSender() {
+            val catalog = channelCatalog
+            val id = journalName
+            mutableGroupSender.value = if (id != null && catalog?.complete == true && !groupBlocked &&
+                !commandChannelUncertain && mutableStatus.value.active
+            ) {
+                GroupSender(discoverSession, id, catalog.slots.mapTo(mutableSetOf()) { it.channel.identity },
+                    GroupSend.scopeOptions(firmwareVersion ?: 0), GroupSend.textLimit(mtu),
+                    group != null || contactTransfer != null || channelQuery != null || telemetryQuery != null ||
+                        messageSync != null || searches.history.value.busy)
+            } else null
+        }
+
+        fun sendGroup(session: String, companion: String, identity: String, text: String, scope: String,
+                      completed: (String?) -> Unit) = guarded {
+            val connection = gatt
+            val sender = mutableGroupSender.value
+            val slot = channelCatalog?.slots?.firstOrNull { it.channel.identity == identity }
+            if (connection == null || sender == null || sender.session != session || sender.companion != companion ||
+                slot == null || sender.busy || group != null
+            ) {
+                completed("Companion oder Kanal ist gerade nicht sendebereit.")
+                return@guarded
+            }
+            val bytes = GroupSend.textBytes(text)
+            if (scope !in sender.scopes || bytes == null || bytes.size > sender.maxBytes) {
+                completed("Ungültiger Scope oder Nachrichtentext.")
+                return@guarded
+            }
+            try {
+                val oldOverride = history.groupScopeDirty(companion)
+                if (oldOverride && (firmwareVersion ?: 0) < GroupSend.SCOPE_MIN_VERSION) {
+                    completed("Der Scope-Override konnte mit dieser Firmware nicht zurückgesetzt werden.")
+                    return@guarded
+                }
+                val now = System.currentTimeMillis()
+                val channel = HistoryChannel(identity, slot.channel.name, slot.index)
+                val (id, wireTime) = history.beginGroup(companion, channel, text, now, scope) { timestamp ->
+                    selfName?.let { GroupSend.repeatDigest(slot.channel, timestamp, it, bytes) }
+                }
+                val tx = GroupTransaction(id, scope, GroupSend.command(slot.index, wireTime, bytes), completed)
+                group = tx
+                publishContacts(mutableStatus.value.contacts)
+                val override = GroupSend.scopeOverride(scope)
+                if (override != null || oldOverride) {
+                    history.setGroupScopeDirty(companion, true)
+                    writeGroup(connection, tx, GroupStage.PREPARE, override ?: GroupSend.restoreScope)
+                } else {
+                    writeGroup(connection, tx, GroupStage.SEND, tx.command)
+                }
+            } catch (_: SQLiteException) {
+                val message = "Sendevorgang konnte nicht gespeichert werden."
+                val tx = group
+                if (tx == null) completed(message) else finishGroup(tx, message, uncertain = true)
+            }
+        }
+
+        private fun writeGroup(connection: BluetoothGatt, tx: GroupTransaction, stage: GroupStage, bytes: ByteArray) {
+            tx.stage = stage
+            tx.reply = CompanionRead(bytes, CompanionProtocol.OK)
+            if (stage == GroupStage.SEND) tx.status = GroupSendStatus.UNKNOWN
+            if (!write(connection, tx.reply.command)) {
+                if (stage == GroupStage.SEND) {
+                    tx.status = GroupSendStatus.FAILED
+                    restoreGroupScope(connection, tx, "BLE-Schreibvorgang konnte nicht gestartet werden.")
+                } else {
+                    finishGroup(tx, "Scope-Befehl konnte nicht gestartet werden.", uncertain = true)
+                }
+                return
+            }
+            timeout = Runnable {
+                finishGroup(tx, "Zeitüberschreitung bei der Companion-Antwort.", uncertain = true)
+            }.also { handler.postDelayed(it, 5_000) }
+        }
+
+        private fun nextGroupWrite(connection: BluetoothGatt, tx: GroupTransaction, stage: GroupStage, bytes: ByteArray) {
+            handler.postDelayed({
+                guarded { if (group === tx) writeGroup(connection, tx, stage, bytes) }
+            }, 100)
+        }
+
+        private fun groupProgress(connection: BluetoothGatt, tx: GroupTransaction) {
+            val reply = tx.reply.result ?: return
+            if (timeout == null) return
+            clearTimeout()
+            val accepted = reply.contentEquals(byteArrayOf(CompanionProtocol.OK.toByte()))
+            val rejected = reply.size == 2 && reply[0].toInt() == CompanionProtocol.ERROR
+            if (!accepted && !rejected) {
+                finishGroup(tx, "Ungültige Companion-Antwort.", uncertain = true)
+                return
+            }
+            val rejection = if (rejected) "Companion-Code ${reply[1].toInt() and 0xff}." else null
+            try {
+                when (tx.stage) {
+                    GroupStage.PREPARE -> if (accepted) {
+                        if (tx.scope == GroupSend.DEFAULT) history.setGroupScopeDirty(checkNotNull(journalName), false)
+                        nextGroupWrite(connection, tx, GroupStage.SEND, tx.command)
+                    } else {
+                        restoreGroupScope(connection, tx, "Scope abgelehnt. $rejection")
+                    }
+                    GroupStage.SEND -> {
+                        tx.status = if (accepted) GroupSendStatus.ACCEPTED else GroupSendStatus.REJECTED
+                        history.updateGroup(tx.id, tx.status)
+                        restoreGroupScope(connection, tx, rejection)
+                    }
+                    GroupStage.RESTORE -> if (accepted) {
+                        history.setGroupScopeDirty(checkNotNull(journalName), false)
+                        finishGroup(tx, tx.error)
+                    } else finishGroup(tx, "Scope konnte nicht zurückgesetzt werden. $rejection", uncertain = true)
+                }
+            } catch (_: SQLiteException) {
+                finishGroup(tx, "Sendevorgang konnte nicht aktualisiert werden.", uncertain = true)
+            }
+        }
+
+        private fun restoreGroupScope(connection: BluetoothGatt, tx: GroupTransaction, error: String?) {
+            tx.error = error
+            if (history.groupScopeDirty(checkNotNull(journalName))) {
+                nextGroupWrite(connection, tx, GroupStage.RESTORE, GroupSend.restoreScope)
+            } else finishGroup(tx, error)
+        }
+
+        private fun recordGroupResult(tx: GroupTransaction): Boolean = try {
+            history.updateGroup(tx.id, tx.status)
+            true
+        } catch (_: SQLiteException) {
+            false
+        }
+
+        private fun finishGroup(tx: GroupTransaction, error: String?, uncertain: Boolean = false) {
+            group = null
+            clearTimeout()
+            val stored = recordGroupResult(tx)
+            val message = if (stored) error else "Sendestatus konnte nicht gespeichert werden."
+            tx.completed(message)
+            if (uncertain) {
+                finish("${message.orEmpty()} Companion erneut verbinden.", error = true)
+            } else {
+                publishContacts(mutableStatus.value.contacts)
+                handler.post(resumeMessageSync)
+            }
+        }
+
         private fun discoverUnavailable(): String? = when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
+            group != null -> "Kanalnachricht wird gesendet …"
             discoverDisabled != null -> discoverDisabled
             firmwareVersion == null -> "Companion-Protokollversion für DISCOVER fehlt."
             (firmwareVersion ?: 0) < CompanionProtocol.DISCOVER_MIN_VERSION ->
@@ -717,6 +924,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 { searches.endCooldown(SystemClock.elapsedRealtime()) }, DiscoverSearches.COOLDOWN_MS,
             )
             discoverReply = DiscoverCommandReply()
+            publishGroupSender()
             timeout = Runnable {
                 failDiscover("Zeitüberschreitung bei der Companion-Bestätigung.", uncertain = true)
             }.also { handler.postDelayed(it, DiscoverSearches.REPLY_TIMEOUT_MS) }
@@ -734,6 +942,7 @@ internal class CompanionConnection(private val context: Context, private val his
                     timeout = Runnable {
                         clearTimeout()
                         searches.complete()
+                        publishGroupSender()
                         startMessageSync()
                     }.also { handler.postDelayed(it, DiscoverSearches.LISTEN_MS) }
                 }
@@ -814,6 +1023,12 @@ internal class CompanionConnection(private val context: Context, private val his
         fun finish(message: String, error: Boolean = false) {
             if (current !== this) return
             current = null
+            mutableGroupSender.value = null
+            group?.let { tx ->
+                recordGroupResult(tx)
+                tx.completed(message)
+            }
+            group = null
             handler.removeCallbacks(pollTelemetry)
             handler.removeCallbacks(resumeMessageSync)
             clearTimeout()

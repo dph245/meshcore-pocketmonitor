@@ -46,6 +46,20 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val scan = mutableScan.asStateFlow()
     val connectionStatus = connection.status
     val discover = connection.discover
+    val groupSender = connection.groupSender
+
+    fun groupScope(companion: String, channel: String) = history.groupScope(companion, channel)
+
+    fun groupRepeats(id: Long) = history.groupRepeats(id)
+
+    fun groupRepeaterNames(companion: String) = history.groupRepeaterNames(companion)
+
+    fun sendGroup(session: String, companion: String, channel: String, text: String, scope: String,
+                  completed: (String?) -> Unit) {
+        connection.sendGroup(session, companion, channel, text, scope) { error ->
+            viewModelScope.launch { completed(error) }
+        }
+    }
 
     init {
         viewModelScope.launch {

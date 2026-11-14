@@ -4,7 +4,7 @@ PocketMonitor öffnet beim Start den zuletzt gesehenen Companion. Getrennt von B
 
 ## Datenmodell
 
-Die Datenbank `databases/companion-history.db` verwendet Androids `SQLiteOpenHelper` mit Write-Ahead Logging, Fremdschlüsseln und Schema-Version 2. Die App legt die Datenbank im privaten App-Speicher an. Backups und Gerätetransfer sind in der App-Konfiguration ausgeschlossen.
+Die Datenbank `databases/companion-history.db` verwendet Androids `SQLiteOpenHelper` mit Write-Ahead Logging, Fremdschlüsseln und Schema-Version 3. Die App legt die Datenbank im privaten App-Speicher an. Backups und Gerätetransfer sind in der App-Konfiguration ausgeschlossen.
 
 | Tabelle | Inhalt |
 | --- | --- |
@@ -12,6 +12,9 @@ Die Datenbank `databases/companion-history.db` verwendet Androids `SQLiteOpenHel
 | `channel` | Companion, Konversations-ID aus Kanal-Fingerabdruck, unbekanntem Slot oder PM-Identität, zuletzt bekannter Name und optionaler aktueller Slot. |
 | `rx` | Companion, Sitzungs-ID, Sequenz, Empfangszeit in Millisekunden, Notification-Code, unveränderte Bytes als BLOB und optionaler Nachrichtenbezug. Die Funk-Metadaten SNR und RSSI stehen in den Originalbytes. |
 | `message` | Companion, Kanalidentität, `comparisonId`, Absender, Sender-Zeitstempel, Text und getrennte Zähler für noch gespeicherte Funkempfänge und Abholantworten. |
+| `group_send` | Ausgehender Sendevorgang zur Nachricht mit Scope, Annahmestatus, Sendezeit und Digest des erwarteten Funk-Payloads. |
+| `group_repeat` | Verknüpft jeden beobachteten Repeat mit seiner eigenen RX-Zeile und dem letzten Hop-Präfix. |
+| `group_scope` / `group_repeater` | Letzter verwendeter Scope je Companion und Kanal sowie letzter vollständiger Repeater-Kontaktbestand je Companion. |
 | `legacy_import` | Zuletzt bestätigte Sequenz je TSV-Datei während des Imports. |
 
 Eine neue BLE-Adresse oder ein neuer Anzeigename ändert die Companion-Zuordnung nicht, solange der öffentliche MeshCore-Schlüssel gleich bleibt. Ein Identitätswechsel erzeugt eine neue Historie. Eine unvollständige oder ungültige `SELF_INFO`-Antwort kann keinem Companion zugeordnet werden. Bis zur Identifikation puffert die App die Frames im Speicher.
@@ -24,14 +27,14 @@ Die eindeutige Kombination aus Companion, Kanalidentität und `comparisonId` fas
 
 - Kanal- und Scope-Abfragen sowie Antworten mit BLE-PIN oder privatem Geräteschlüssel werden beim Journaling ausgelassen. Funk-RX bleibt bytegetreu erhalten. SQLite speichert decodierten Kanaltext im Klartext innerhalb des privaten App-Speichers.
 - Während einer Verbindung nutzt die App die gelesenen Schlüssel im Arbeitsspeicher. Neu verfügbare Schlüssel können noch unverknüpfte Funk-RX-Zeilen in begrenzten Stapeln nachdecodieren. Bereits decodierte Nachrichten bleiben offline verfügbar. Für bisher unlesbare Channel-Pakete muss der passende Kanalschlüssel nochmals über den Companion verfügbar sein. Private Unterhaltungen verwenden den vom Companion entschlüsselten Text. [Nachrichtenabgleich](message-sync.md)
-- Die Frist beträgt 30 × 24 Stunden ab lokaler Empfangszeit. Die App bereinigt beim Start vor der Anzeige und danach einmal pro Minute, solange das ViewModel läuft. Eine Nachricht bleibt bis zum Ablauf ihres letzten gespeicherten Empfangs erhalten. Die Senderuhr beeinflusst nur die Anzeige und Sortierung. Bekannte Companions und aktuelle Slotkonfigurationen bleiben erhalten. Ungenutzte archivierte Kanalmetadaten werden bereinigt.
+- Die Frist beträgt 30 × 24 Stunden ab lokaler Empfangszeit. Die App bereinigt beim Start vor der Anzeige und danach einmal pro Minute, solange das ViewModel läuft. Eine Nachricht bleibt bis zum Ablauf ihres letzten gespeicherten Empfangs erhalten. Eigene Sendevorgänge laufen nach 30 Tagen ab lokaler Sendezeit ab. Ihre RX-Rohzeilen folgen weiterhin der Frist ab Empfang. Die Senderuhr beeinflusst nur die Anzeige und Sortierung. Bekannte Companions und aktuelle Slotkonfigurationen bleiben erhalten. Ungenutzte archivierte Kanalmetadaten werden bereinigt.
 - Schreibvorgänge und Decodierung laufen außerhalb des Android-Main-Threads. Beim normalen Trennen schreibt der Worker die bereits akzeptierte Warteschlange zu Ende. Ein abruptes Prozessende kann noch nicht bestätigte Stapel verlieren. Die App protokolliert nur von Android zugestellte Notifications. Die DISCOVER-Läufe bleiben sitzungsbezogen im Arbeitsspeicher, ihre empfangenen Funkpakete sind Teil des RX-Journals.
 
 ## Migration aus TSV
 
 Beim ersten Start liest die App alte `files/rx/rx-*.tsv`-Dateien stapelweise. Sie leitet die Companion-Identität aus `SELF_INFO` ab, übernimmt noch gültige RX-Zeilen und verwendet vorhandene Kanalantworten während des Imports zur Decodierung. Für Slots dient die zuletzt protokollierte Antwort als beste verfügbare Information. Alte Journale zeichnen keine vollständigen Konfigurations-Snapshots auf. Eine aus der Migration geschätzte Belegung wird bei der nächsten vollständigen Abfrage aktualisiert.
 
-Der Fortschritt wird gemeinsam mit den importierten Zeilen bestätigt, damit ein unterbrochener Import fortgesetzt werden kann. Nach Abschluss entfernt die App die TSV-Quelle, die möglicherweise noch Schlüssel oder die BLE-PIN enthält. Dateien ohne eindeutige vollständige Identität werden beim Übergang verworfen. Abgelaufene RX-Zeilen werden beim Import übersprungen. Die Migration von SQLite-Schema 1 auf 2 ergänzt die Abholzähler und aktualisiert die Trigger, die die Zähler und die Aufbewahrung pflegen.
+Der Fortschritt wird gemeinsam mit den importierten Zeilen bestätigt, damit ein unterbrochener Import fortgesetzt werden kann. Nach Abschluss entfernt die App die TSV-Quelle, die möglicherweise noch Schlüssel oder die BLE-PIN enthält. Dateien ohne eindeutige vollständige Identität werden beim Übergang verworfen. Abgelaufene RX-Zeilen werden beim Import übersprungen. Die Migration von SQLite-Schema 1 auf 2 ergänzt die Abholzähler und aktualisiert die Trigger, die die Zähler und die Aufbewahrung pflegen. Die Migration auf 3 ergänzt die Group-TX-Tabellen, den Wire-Zeitstempel und den Wiederherstellungszustand für den flüchtigen Scope-Override. [Group-TX](group-tx.md)
 
 ## Prüfung
 

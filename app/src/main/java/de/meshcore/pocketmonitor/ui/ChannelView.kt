@@ -3,6 +3,7 @@ package de.meshcore.pocketmonitor.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -36,6 +37,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import de.meshcore.pocketmonitor.protocol.GroupSend
 import androidx.lifecycle.repeatOnLifecycle
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
 import de.meshcore.pocketmonitor.rx.HistoryChannel
@@ -188,10 +191,39 @@ private fun PagedConversation(
             }
         }
     }
+    val liveSender by model.groupSender.collectAsStateWithLifecycle()
+    val sender = liveSender?.takeIf { it.companion == companion && channel.identity in it.channels }
+    var draft by rememberSaveable { mutableStateOf("") }
+    var scope by rememberSaveable { mutableStateOf<String?>(null) }
+    var sendError by remember { mutableStateOf<String?>(null) }
+    var submitting by remember { mutableStateOf(false) }
+    var detailId by rememberSaveable { mutableStateOf<Long?>(null) }
+    if (!privateMessages) {
+        LaunchedEffect(model, companion, channel.identity) {
+            if (scope == null) {
+                try {
+                    scope = withContext(Dispatchers.IO) { model.groupScope(companion, channel.identity) }
+                        ?: GroupSend.DEFAULT
+                } catch (_: SQLiteException) {
+                    scope = GroupSend.DEFAULT
+                    sendError = "Scope-Auswahl konnte nicht gelesen werden."
+                }
+            }
+        }
+        page?.rows?.find { it.sequence == detailId && it.outgoing != null }?.let { message ->
+            GroupDetails(model, companion, message, onDismiss = { detailId = null }, onReuse = {
+                draft = message.text
+                scope = message.outgoing?.scope
+                sendError = null
+                detailId = null
+            })
+        }
+    }
     Column(modifier) {
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         ChannelConversation(channel.name, page?.rows.orEmpty(), onBack, Modifier.weight(1f), list,
-            backLabel = if (privateMessages) "‹ Privat" else "‹ Kanäle")
+            backLabel = if (privateMessages) "‹ Privat" else "‹ Kanäle",
+            onOutgoingDetails = { detailId = it })
         if (page?.hasOlder == true || before != null) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (before != null) TextButton(onClick = {
@@ -208,6 +240,23 @@ private fun PagedConversation(
                 }) { Text("Ältere") }
             }
         }
+        if (!privateMessages) {
+            GroupComposer(draft, { draft = it }, scope, { scope = it }, sender, submitting, sendError) { text, chosen ->
+                val session = sender?.session ?: return@GroupComposer
+                if (submitting) return@GroupComposer
+                submitting = true
+                sendError = null
+                model.sendGroup(session, companion, channel.identity, text, chosen) { result ->
+                    submitting = false
+                    sendError = result
+                    if (result == null && draft == text) {
+                        draft = ""
+                        boundaries = listOf(null)
+                        list.requestScrollToItem(0)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -219,6 +268,7 @@ internal fun ChannelConversation(
     modifier: Modifier = Modifier,
     list: LazyListState = rememberLazyListState(),
     backLabel: String = "‹ Kanäle",
+    onOutgoingDetails: ((Long) -> Unit)? = null,
 ) {
     var displayed by remember { mutableStateOf(messages, referentialEqualityPolicy()) }
     LaunchedEffect(messages, list) {
@@ -249,7 +299,8 @@ internal fun ChannelConversation(
             val typography = MaterialTheme.typography
             val colors = MaterialTheme.colorScheme
             val shape = MaterialTheme.shapes.medium
-            val bubble = Modifier.fillMaxWidth().background(colors.surfaceVariant, shape)
+            val outgoingBubble = Modifier.fillMaxWidth(0.88f).background(colors.primaryContainer, shape)
+            val bubble = Modifier.fillMaxWidth(0.88f).background(colors.surfaceVariant, shape)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
             val senderStyle = typography.titleSmall.copy(color = colors.onSurfaceVariant)
             val timeStyle = typography.labelSmall.copy(color = colors.onSurfaceVariant)
@@ -261,6 +312,20 @@ internal fun ChannelConversation(
                 verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom),
             ) {
                 items(newestFirst, key = { it.sequence }) { message ->
+                    val tx = message.outgoing
+                    if (tx != null) {
+                        val metadata = "${message.timestampLabel} · ${tx.repeats} Repeats"
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            Column(outgoingBubble.combinedClickable(onClick = {}, onLongClick = {
+                                onOutgoingDetails?.invoke(message.sequence)
+                            }, onLongClickLabel = "Sendedetails").padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                ListRowText(message.text, messageStyle.copy(color = colors.onPrimaryContainer))
+                                ListRowText(metadata, timeStyle.copy(color = colors.onPrimaryContainer))
+                                ListRowText(tx.status.label, timeStyle.copy(color = colors.onPrimaryContainer))
+                            }
+                        }
+                        return@items
+                    }
                     val metadata = "${message.timestampLabel} · ${message.receptionLabel}"
                     val announcement = remember(message) {
                         AnnotatedString("${message.senderLabel}\n$metadata\n${message.text}")

@@ -26,6 +26,7 @@ internal class ReceptionWriter(
             val contactsByPrefix: Map<String, List<CompanionContact>>,
             val committed: () -> Unit,
         ) : Event
+        data class Contacts(val contacts: List<CompanionContact>) : Event
         data class Identity(val companion: KnownCompanion) : Event
         data class Configuration(val slots: List<ChannelSlot>, val complete: Boolean) : Event
     }
@@ -54,6 +55,10 @@ internal class ReceptionWriter(
                         beforeIdentity.chunked(128).forEach { history.append(identified.id, session, it, decoding) }
                         beforeIdentity.clear()
                         onIdentified(identified)
+                        event = queue.receiveCatching().getOrNull()
+                    }
+                    is Event.Contacts -> {
+                        companion?.let { history.saveGroupRepeaters(it.id, current.contacts) }
                         event = queue.receiveCatching().getOrNull()
                     }
                     is Event.Configuration -> {
@@ -121,6 +126,8 @@ internal class ReceptionWriter(
     }
 
     fun identify(companion: KnownCompanion) = queue.trySend(Event.Identity(companion)).isSuccess
+
+    fun contacts(contacts: List<CompanionContact>) = queue.trySend(Event.Contacts(contacts)).isSuccess
 
     fun configure(slots: List<ChannelSlot>, complete: Boolean) =
         queue.trySend(Event.Configuration(slots, complete)).isSuccess

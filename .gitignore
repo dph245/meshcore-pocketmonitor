@@ -9,3 +9,5 @@ local.properties
 # Local performance documentation and measurements
 /docs/scroll-performance.md
 /docs/performance-comparison/
+docs/group-tx.md
+docs/companion-history.md

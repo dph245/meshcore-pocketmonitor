@@ -18,6 +18,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
+import de.meshcore.pocketmonitor.protocol.GroupSend
+import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.rx.OutgoingGroup
 import de.meshcore.pocketmonitor.rx.JournalSnapshot
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.RxRow
@@ -37,14 +40,15 @@ class ScrollBenchmarkActivity : ComponentActivity() {
         val count = intent.getIntExtra("rows", 500).coerceIn(50, 50_000)
         val verifyAnchor = intent.getBooleanExtra("verifyAnchor", false)
         val chat = intent.getBooleanExtra("chat", false)
+        val mixed = intent.getBooleanExtra("mixed", false)
         val time = 1_700_000_000L
         val clock = channelClock()
         val messages = if (chat) List(count) { index ->
-            message(index, time, clock.format(Instant.ofEpochSecond(time + index)))
+            message(index, time, clock.format(Instant.ofEpochSecond(time + index)), mixed)
         } else emptyList()
         val burst = if (chat && verifyAnchor) List(250) { offset ->
             val index = count + offset
-            message(index, time, clock.format(Instant.ofEpochSecond(time + index)))
+            message(index, time, clock.format(Instant.ofEpochSecond(time + index)), mixed)
         } else emptyList()
         val snapshot = if (chat) null else {
             val frame = "8800b0150011ac636130151a26a9a6710a2cad0bb9a5b9d8b073aa850126e87c47509a61a47bf107".hexToByteArray()
@@ -89,8 +93,10 @@ class ScrollBenchmarkActivity : ComponentActivity() {
         }
     }
 
-    private fun message(index: Int, time: Long, timestamp: String) = ChannelMessage(
+    private fun message(index: Int, time: Long, timestamp: String, mixed: Boolean) = ChannelMessage(
         index + 1L, "Station ${index % 40}", time + index,
         "Nachricht ${index + 1}: Test der Darstellung bei längeren MeshCore-Nachrichten.", timestamp,
+        outgoing = if (mixed && index % 3 == 0) OutgoingGroup(GroupSend.DEFAULT, GroupSendStatus.ACCEPTED,
+            (index % 5).toLong(), "Public", (time + index) * 1000) else null,
     )
 }

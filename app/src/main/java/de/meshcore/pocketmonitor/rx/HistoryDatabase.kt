@@ -5,7 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 2) {
+    SQLiteOpenHelper(context, name, null, 3) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -59,14 +59,52 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
             END
         """)
         upgradeMessages(db)
+        createGroupSendTables(db)
         db.execSQL("CREATE TABLE legacy_import (session TEXT PRIMARY KEY NOT NULL, ordinal INTEGER NOT NULL)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        check(oldVersion == 1 && newVersion == 2)
-        db.execSQL("DROP TRIGGER rx_link")
-        db.execSQL("DROP TRIGGER rx_delete")
-        upgradeMessages(db)
+        if (oldVersion < 2) {
+            db.execSQL("DROP TRIGGER rx_link")
+            db.execSQL("DROP TRIGGER rx_delete")
+            upgradeMessages(db)
+        }
+        if (oldVersion < 3) createGroupSendTables(db)
+    }
+
+    private fun createGroupSendTables(db: SQLiteDatabase) {
+        db.execSQL("ALTER TABLE companion ADD COLUMN group_wire_time INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE companion ADD COLUMN group_scope_dirty INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("""
+            CREATE TABLE group_send (
+                message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+                companion TEXT NOT NULL REFERENCES companion(id),
+                created_at INTEGER NOT NULL, scope TEXT NOT NULL, status TEXT NOT NULL, digest TEXT,
+                channel_name TEXT NOT NULL
+            )
+        """)
+        db.execSQL("CREATE INDEX group_send_expiry ON group_send(created_at)")
+        db.execSQL("CREATE INDEX group_send_match ON group_send(companion, digest, created_at)")
+        db.execSQL("""
+            CREATE TABLE group_repeat (
+                rx_id INTEGER PRIMARY KEY REFERENCES rx(id) ON DELETE CASCADE,
+                send_id INTEGER NOT NULL REFERENCES group_send(message_id) ON DELETE CASCADE,
+                prefix TEXT NOT NULL
+            )
+        """)
+        db.execSQL("CREATE INDEX group_repeat_send ON group_repeat(send_id, rx_id)")
+        db.execSQL("""
+            CREATE TABLE group_repeater (
+                companion TEXT NOT NULL REFERENCES companion(id), public_key TEXT NOT NULL, name TEXT NOT NULL,
+                PRIMARY KEY(companion, public_key)
+            )
+        """)
+        db.execSQL("""
+            CREATE TABLE group_scope (
+                companion TEXT NOT NULL REFERENCES companion(id), channel TEXT NOT NULL, scope TEXT NOT NULL,
+                PRIMARY KEY(companion, channel)
+            )
+        """)
     }
 
     private fun upgradeMessages(db: SQLiteDatabase) {
