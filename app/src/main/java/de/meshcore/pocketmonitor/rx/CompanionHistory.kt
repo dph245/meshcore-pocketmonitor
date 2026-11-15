@@ -96,9 +96,11 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
               AND message.channel = channel.identity AND substr(comparison, 1, 3) <> 'tx:'
               ORDER BY id DESC LIMIT 1)
         """
+        val contactFilter = if (private) "AND ${visibleConversation("channel.companion", "channel.identity")}" else ""
         return db.rawQuery("""
             SELECT identity, name, slot, $lastIncoming FROM channel WHERE companion = ? AND $visible
                 AND identity ${if (private) "LIKE" else "NOT LIKE"} '${PRIVATE_ID_PREFIX}%'
+                $contactFilter
             ORDER BY slot IS NULL, slot, name, identity
         """, arrayOf(companion)).use { cursor ->
             cursor.collect {
@@ -170,6 +172,21 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     fun saveGroupRepeaters(companion: String, contacts: List<CompanionContact>) =
         GroupHistory(db).saveRepeaters(companion, contacts)
 
+    fun saveContactTypes(companion: String, contacts: List<CompanionContact>) {
+        val database = db
+        database.inTransaction {
+            database.compileStatement("INSERT OR REPLACE INTO contact_type VALUES (?, ?, ?)").use { insert ->
+                insert.bindString(1, companion)
+                for (contact in contacts) {
+                    insert.bindString(2, contact.publicKey)
+                    insert.bindLong(3, contact.type.toLong())
+                    insert.executeInsert()
+                }
+            }
+        }
+        changes.incrementAndGet()
+    }
+
     fun groupRepeaterNames(companion: String) = GroupHistory(db).repeaterNames(companion)
 
     fun append(companion: String, session: String, frames: List<Received>, decoding: ChannelDecoding) {
@@ -229,13 +246,24 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     fun unreadConversations(): Map<String, Set<String>> {
         val result = mutableMapOf<String, MutableSet<String>>()
-        db.rawQuery("SELECT DISTINCT companion, channel FROM message WHERE unread = 1", null).use { cursor ->
+        db.rawQuery("""
+            SELECT DISTINCT companion, channel FROM message
+            WHERE unread = 1 AND ${visibleConversation("message.companion", "message.channel")}
+        """, null).use { cursor ->
             while (cursor.moveToNext()) {
                 result.getOrPut(cursor.getString(0)) { mutableSetOf() }.add(cursor.getString(1))
             }
         }
         return result
     }
+
+    private fun visibleConversation(companion: String, identity: String): String = """
+        ($identity NOT LIKE '${PRIVATE_ID_PREFIX}%' OR NOT EXISTS (
+            SELECT 1 FROM contact_type WHERE contact_type.companion = $companion
+                AND public_key = substr($identity, ${PRIVATE_ID_PREFIX.length + 1})
+                AND type IN (${CompanionContact.TYPE_REPEATER}, ${CompanionContact.TYPE_ROOM_SERVER})
+        ))
+    """
 
     fun markRead(companion: String, channel: String, ids: List<Long>) {
         if (ids.isEmpty()) return

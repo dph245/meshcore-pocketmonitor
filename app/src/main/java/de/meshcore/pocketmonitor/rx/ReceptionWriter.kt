@@ -58,7 +58,10 @@ internal class ReceptionWriter(
                         event = queue.receiveCatching().getOrNull()
                     }
                     is Event.Contacts -> {
-                        companion?.let { history.saveGroupRepeaters(it.id, current.contacts) }
+                        companion?.let {
+                            history.saveGroupRepeaters(it.id, current.contacts)
+                            history.saveContactTypes(it.id, current.contacts)
+                        }
                         event = queue.receiveCatching().getOrNull()
                     }
                     is Event.Configuration -> {

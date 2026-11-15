@@ -19,12 +19,15 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import de.meshcore.pocketmonitor.ble.GroupSender
 import de.meshcore.pocketmonitor.protocol.CompanionEvent
@@ -41,6 +44,9 @@ internal fun GroupComposer(
     sender: GroupSender?, submitting: Boolean, error: String?, send: (String, String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    var input by remember { mutableStateOf(TextFieldValue(draft, TextRange(draft.length))) }
+    val fieldValue = if (input.text == draft) input else TextFieldValue(draft, TextRange(draft.length))
+    SideEffect { if (input != fieldValue) input = fieldValue }
     val bytes = remember(draft) { GroupSend.textBytes(draft)?.size }
     val validScope = scope != null && sender?.scopes?.contains(scope) == true
     val tooLong = bytes != null && sender != null && bytes > sender.maxBytes
@@ -62,7 +68,10 @@ internal fun GroupComposer(
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(value = draft, onValueChange = edit, modifier = Modifier.weight(1f),
+            OutlinedTextField(value = fieldValue, onValueChange = {
+                input = it
+                edit(it.text)
+            }, modifier = Modifier.weight(1f),
                 placeholder = { Text("Nachricht") }, minLines = 1, maxLines = 3, isError = tooLong,
                 enabled = !submitting)
             Button(onClick = { scope?.let { send(draft, it) } },

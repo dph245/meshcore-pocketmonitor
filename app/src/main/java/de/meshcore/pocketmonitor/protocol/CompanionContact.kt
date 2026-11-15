@@ -16,17 +16,19 @@ internal data class CompanionContact(
     val lastModifiedSeconds: Long,
 ) {
     val displayName: String get() = name.ifBlank { "Ohne Namen" }
+    val isPrivateMessageContact: Boolean get() = type != TYPE_REPEATER && type != TYPE_ROOM_SERVER
     val typeLabel: String get() = when (type) {
         0 -> "Unbekannt"
         1 -> "Client"
         TYPE_REPEATER -> "Repeater"
-        3 -> "RoomServer"
+        TYPE_ROOM_SERVER -> "RoomServer"
         4 -> "Sensor"
         else -> "Typ 0x${type.toString(16).uppercase().padStart(2, '0')}"
     }
 
     companion object {
         const val TYPE_REPEATER = 2
+        const val TYPE_ROOM_SERVER = 3
 
         // MyMesh::writeContactRespFrame, including the response code.
         fun decode(frame: ByteArray): CompanionContact? {

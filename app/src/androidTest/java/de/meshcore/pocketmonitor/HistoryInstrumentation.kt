@@ -62,6 +62,7 @@ class HistoryInstrumentation : Instrumentation() {
                     verifyLegacyImport(history, legacy)
                 }
                 verifyMessageSync()
+                verifyPrivateContactFilter()
                 verifyGroupSend()
                 verifyPrivateSend()
             }
@@ -244,6 +245,42 @@ class HistoryInstrumentation : Instrumentation() {
         }
     }
 
+    private fun verifyPrivateContactFilter() {
+        val file = "contact-filter-test-${UUID.randomUUID()}.db"
+        val client = CompanionContact("AA".repeat(32), "Client", 1, 0, 0, "", 0, 0.0, 0.0, 0)
+        val repeater = client.copy(publicKey = "BB".repeat(32), type = CompanionContact.TYPE_REPEATER)
+        val room = client.copy(publicKey = "CC".repeat(32), type = CompanionContact.TYPE_ROOM_SERVER)
+        val contacts = listOf(client, repeater, room)
+        val byPrefix = contacts.groupBy { it.publicKey.take(12) }
+        try {
+            HistoryDatabase(targetContext, file).use { db ->
+                val history = CompanionHistory(db)
+                history.register(id, "Companion", now)
+                history.register(other, "Other Companion", now)
+                history.saveContactTypes(id, contacts)
+                for ((index, contact) in contacts.withIndex()) {
+                    val frame = "10f40000${contact.publicKey.take(12)}ff0001020304".hexToByteArray() +
+                        "Privat".encodeToByteArray()
+                    history.appendQueued(id, "filter", Received(index + 1L, RxFrame(now, frame)), emptyList(), byPrefix)
+                    if (contact == repeater) {
+                        history.appendQueued(other, "other-filter", Received(1, RxFrame(now, frame)), emptyList(), byPrefix)
+                    }
+                }
+            }
+            HistoryDatabase(targetContext, file).use { db ->
+                val history = CompanionHistory(db)
+                check(history.channels(id, private = true).single().identity == "pm:${client.publicKey}")
+                check(history.channels(other, private = true).single().identity == "pm:${repeater.publicKey}")
+                check(history.unreadConversations()[id] == setOf("pm:${client.publicKey}"))
+                for (contact in contacts) {
+                    check(history.messages(id, "pm:${contact.publicKey}", null).rows.single().text == "Privat")
+                }
+            }
+        } finally {
+            targetContext.deleteDatabase(file)
+        }
+    }
+
     private fun verifyPrivateSend() {
         val file = "private-send-${UUID.randomUUID()}.db"
         val contact = CompanionContact("CC".repeat(32), "Ada", 1, 0, 0, "", 0, 0.0, 0.0, 0)
@@ -303,6 +340,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("DROP TABLE group_send")
                 db.execSQL("DROP TABLE group_scope")
                 db.execSQL("DROP TABLE group_repeater")
+                db.execSQL("DROP TABLE contact_type")
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_wire_time")
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_scope_dirty")
                 db.version = 2

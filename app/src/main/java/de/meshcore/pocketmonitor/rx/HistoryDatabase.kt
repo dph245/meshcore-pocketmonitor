@@ -3,9 +3,10 @@ package de.meshcore.pocketmonitor.rx
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import de.meshcore.pocketmonitor.protocol.CompanionContact
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 6) {
+    SQLiteOpenHelper(context, name, null, 7) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -63,6 +64,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         createPrivateSendTable(db)
         addUnreadColumn(db)
         indexIncomingMessages(db)
+        createContactTypes(db)
         db.execSQL("CREATE TABLE legacy_import (session TEXT PRIMARY KEY NOT NULL, ordinal INTEGER NOT NULL)")
     }
 
@@ -76,6 +78,22 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         if (oldVersion < 4) createPrivateSendTable(db)
         if (oldVersion < 5) addUnreadColumn(db)
         if (oldVersion < 6) indexIncomingMessages(db)
+        if (oldVersion < 7) {
+            createContactTypes(db)
+            db.execSQL("""
+                INSERT INTO contact_type (companion, public_key, type)
+                SELECT companion, public_key, ${CompanionContact.TYPE_REPEATER} FROM group_repeater
+            """)
+        }
+    }
+
+    private fun createContactTypes(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE contact_type (
+                companion TEXT NOT NULL REFERENCES companion(id), public_key TEXT NOT NULL, type INTEGER NOT NULL,
+                PRIMARY KEY (companion, public_key)
+            )
+        """)
     }
 
     private fun addUnreadColumn(db: SQLiteDatabase) {
