@@ -5,6 +5,7 @@ import android.app.Instrumentation
 import android.os.Bundle
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
 import de.meshcore.pocketmonitor.protocol.HopResolver
 import de.meshcore.pocketmonitor.protocol.HopStatus
 import de.meshcore.pocketmonitor.rx.HistoryChannel
@@ -62,8 +63,9 @@ class HistoryInstrumentation : Instrumentation() {
                 }
                 verifyMessageSync()
                 verifyGroupSend()
+                verifyPrivateSend()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private messages, group send, repeats, migration and paging\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private RX and TX, group send, repeats, migration and paging\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -176,6 +178,15 @@ class HistoryInstrumentation : Instrumentation() {
                 check(history.messages(id, "pm:$contactKey", null).rows.single().let {
                     it.sender == "Ada" && it.text == "Privat" && it.receptionCount == 0L && it.synchronized
                 })
+                val privateIdentity = "pm:$contactKey"
+                val original = history.messages(id, privateIdentity, null).rows.single()
+                check(original.unread)
+                check(history.channels(id, private = true).single().lastIncoming == original.sequence)
+                check(history.unreadConversations()[id] == setOf(public.identity, privateIdentity))
+                history.markRead(id, public.identity, listOf(original.sequence))
+                check(history.messages(id, privateIdentity, null).rows.single().unread)
+                history.markRead(id, privateIdentity, listOf(original.sequence))
+                check(history.unreadConversations()[id] == setOf(public.identity))
                 val writer = ReceptionWriter(history, onIdentified = {}, onError = { error(it) })
                 check(writer.identify(KnownCompanion(id, "Companion")))
                 for (frame in listOf(publicFrame, channel, pm)) {
@@ -194,11 +205,24 @@ class HistoryInstrumentation : Instrumentation() {
                 }
                 writer.close()
                 withTimeout(10_000) { writer.completion.join() }
-                val privatePage = history.messages(id, "pm:$contactKey", null)
+                val privatePage = history.messages(id, privateIdentity, null, includeUnreadThrough = true)
                 val first = privatePage.rows.first()
                 check(privatePage.rows.size == CHAT_PAGE_SIZE && privatePage.hasOlder)
-                check(history.messages(id, "pm:$contactKey", MessageCursor(first.timestampSeconds, first.sequence))
-                    .rows.map { it.text } == listOf("Privat", "Seite 0"))
+                val older = history.messages(id, privateIdentity, MessageCursor(first.timestampSeconds, first.sequence)).rows
+                check(older.map { it.text } == listOf("Privat", "Seite 0"))
+                check(!older[0].unread && older[1].unread)
+                val unreadThrough = checkNotNull(privatePage.unreadThrough)
+                val concurrent = pm.copyOf(16) + "Später eingegangen".encodeToByteArray()
+                history.appendQueued(id, "later-sync", Received(1, RxFrame(now, concurrent)), slot, contacts)
+                history.markReadThrough(id, privateIdentity, unreadThrough)
+                check(history.messages(id, privateIdentity, null).rows.filter { it.unread }.single().text ==
+                    "Später eingegangen")
+                check(history.messages(id, privateIdentity, MessageCursor(first.timestampSeconds, first.sequence))
+                    .rows.none { it.unread })
+                val refreshed = history.messages(id, privateIdentity, null, includeUnreadThrough = true)
+                history.markReadThrough(id, privateIdentity, checkNotNull(refreshed.unreadThrough))
+                check(privateIdentity !in history.unreadConversations()[id].orEmpty())
+                check(public.identity in history.unreadConversations()[id].orEmpty())
                 check(history.channels(id, private = true).map { it.identity }.toSet() ==
                     setOf("pm:$contactKey", "pm:prefix:$prefix", "pm:prefix:12CDEF012345"))
                 check(history.channels(id).map { it.identity }.toSet() == setOf(public.identity, "slot:5"))
@@ -214,6 +238,39 @@ class HistoryInstrumentation : Instrumentation() {
                 })
                 history.prune(now + HISTORY_AGE_MS + 1)
                 check(history.channels(id, private = true).isEmpty() && history.channels(id).isEmpty())
+            }
+        } finally {
+            targetContext.deleteDatabase(file)
+        }
+    }
+
+    private fun verifyPrivateSend() {
+        val file = "private-send-${UUID.randomUUID()}.db"
+        val contact = CompanionContact("CC".repeat(32), "Ada", 1, 0, 0, "", 0, 0.0, 0.0, 0)
+        val channel = "pm:" + contact.publicKey
+        try {
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                history.register(id, "Companion", now)
+                history.register(other, "Other", now)
+                val (accepted, time) = history.beginPrivate(id, contact, "Bestätigt", now)
+                check(history.unreadConversations().isEmpty())
+                check(history.messages(id, channel, null).rows.single().privateSend == PrivateSendStatus.WAITING)
+                history.updatePrivate(accepted, PrivateSendStatus.ACKNOWLEDGED)
+                val (unfinished, nextTime) = history.beginPrivate(id, contact, "Unterbrochen", now)
+                check(nextTime == time + 1)
+                history.updatePrivate(unfinished, PrivateSendStatus.ACCEPTED)
+                check(history.channels(id, private = true).single().let { it.identity == channel && it.lastIncoming == null })
+                check(history.messages(other, channel, null).rows.isEmpty())
+                check(history.channels(id).isEmpty())
+            }
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                val rows = history.messages(id, channel, null).rows
+                check(rows.map { it.text } == listOf("Bestätigt", "Unterbrochen"))
+                check(rows.map { it.privateSend } == listOf(PrivateSendStatus.ACKNOWLEDGED, PrivateSendStatus.UNKNOWN))
+                history.prune(now + HISTORY_AGE_MS + 1)
+                check(history.messages(id, channel, null).rows.isEmpty())
             }
         } finally {
             targetContext.deleteDatabase(file)
@@ -238,6 +295,10 @@ class HistoryInstrumentation : Instrumentation() {
 
                 // Retain populated v2 tables and triggers while removing the v3 schema.
                 val db = helper.writableDatabase
+                db.execSQL("DROP INDEX message_incoming")
+                db.execSQL("DROP INDEX message_unread")
+                db.execSQL("ALTER TABLE message DROP COLUMN unread")
+                db.execSQL("DROP TABLE private_send")
                 db.execSQL("DROP TABLE group_repeat")
                 db.execSQL("DROP TABLE group_send")
                 db.execSQL("DROP TABLE group_scope")
@@ -249,6 +310,7 @@ class HistoryInstrumentation : Instrumentation() {
             val firstId = HistoryDatabase(targetContext, file).use { helper ->
                 val history = CompanionHistory(helper)
                 check(history.messages(id, public.identity, null).rows.single().outgoing == null)
+                check(history.unreadConversations().isEmpty())
                 history.register(other, "Companion", now)
                 val (first, wireTime) = history.beginGroup(id, channel, text, now, "#de", ::digest)
                 check(history.messages(id, public.identity, null).rows.single { it.sequence == first }.outgoing?.status == GroupSendStatus.UNKNOWN)

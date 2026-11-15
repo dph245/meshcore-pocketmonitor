@@ -12,7 +12,9 @@ internal object MeshPacketDecoder {
     private const val MAX_ADVERT_APP_BYTES = 32
     private const val TRACE_FIXED_BYTES = 9
 
-    fun decode(bytes: ByteArray, channels: ChannelDecoding = ChannelDecoding.default): MeshPacket {
+    fun decode(
+        bytes: ByteArray, channels: ChannelDecoding = ChannelDecoding.default, calculateComparison: Boolean = true,
+    ): MeshPacket {
         var packet = MeshPacket(bytes.size)
         if (bytes.isEmpty()) return packet.malformed("Funkpaket-Header fehlt.")
 
@@ -63,7 +65,7 @@ internal object MeshPacketDecoder {
             null -> packet.unsupported("Unbekannter Pakettyp.")
         }
 
-        if (decoded.status == DecodeStatus.MALFORMED) return decoded
+        if (!calculateComparison || decoded.status == DecodeStatus.MALFORMED) return decoded
         // Packet::calculatePacketHash: type + (TRACE only: uint16 path_len, LE) + payload.
         val hash = MessageDigest.getInstance("SHA-256")
         hash.update(header.typeCode.toByte())

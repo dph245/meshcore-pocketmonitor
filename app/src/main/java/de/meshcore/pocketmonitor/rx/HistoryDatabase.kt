@@ -5,7 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 3) {
+    SQLiteOpenHelper(context, name, null, 6) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -60,6 +60,9 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         """)
         upgradeMessages(db)
         createGroupSendTables(db)
+        createPrivateSendTable(db)
+        addUnreadColumn(db)
+        indexIncomingMessages(db)
         db.execSQL("CREATE TABLE legacy_import (session TEXT PRIMARY KEY NOT NULL, ordinal INTEGER NOT NULL)")
     }
 
@@ -70,6 +73,39 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
             upgradeMessages(db)
         }
         if (oldVersion < 3) createGroupSendTables(db)
+        if (oldVersion < 4) createPrivateSendTable(db)
+        if (oldVersion < 5) addUnreadColumn(db)
+        if (oldVersion < 6) indexIncomingMessages(db)
+    }
+
+    private fun addUnreadColumn(db: SQLiteDatabase) {
+        db.execSQL("ALTER TABLE message ADD COLUMN unread INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("CREATE INDEX message_unread ON message(companion, channel) WHERE unread = 1")
+    }
+
+    private fun indexIncomingMessages(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE INDEX message_incoming ON message(companion, channel, id DESC)
+            WHERE substr(comparison, 1, 3) <> 'tx:'
+        """)
+    }
+
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        // A new process only restores history. It never resumes an RF transmission.
+        db.execSQL("""
+            UPDATE private_send SET status = 'UNKNOWN' WHERE status IN ('WAITING', 'ACCEPTED')
+        """)
+    }
+
+    private fun createPrivateSendTable(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE private_send (
+                message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL, status TEXT NOT NULL
+            )
+        """)
+        db.execSQL("CREATE INDEX private_send_expiry ON private_send(created_at)")
     }
 
     private fun createGroupSendTables(db: SQLiteDatabase) {

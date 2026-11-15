@@ -39,6 +39,7 @@ class ScrollBenchmarkActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val count = intent.getIntExtra("rows", 500).coerceIn(50, 50_000)
         val verifyAnchor = intent.getBooleanExtra("verifyAnchor", false)
+        val verifyFollowLatest = intent.getBooleanExtra("verifyFollowLatest", false)
         val chat = intent.getBooleanExtra("chat", false)
         val mixed = intent.getBooleanExtra("mixed", false)
         val time = 1_700_000_000L
@@ -46,7 +47,7 @@ class ScrollBenchmarkActivity : ComponentActivity() {
         val messages = if (chat) List(count) { index ->
             message(index, time, clock.format(Instant.ofEpochSecond(time + index)), mixed)
         } else emptyList()
-        val burst = if (chat && verifyAnchor) List(250) { offset ->
+        val burst = if (chat && (verifyAnchor || verifyFollowLatest)) List(250) { offset ->
             val index = count + offset
             message(index, time, clock.format(Instant.ofEpochSecond(time + index)), mixed)
         } else emptyList()
@@ -64,9 +65,9 @@ class ScrollBenchmarkActivity : ComponentActivity() {
                 if (snapshot == null) {
                     val list = rememberLazyListState()
                     var displayed by remember { mutableStateOf(messages) }
-                    ChannelConversation("Public", displayed, {}, modifier, list)
-                    LaunchedEffect(verifyAnchor) {
-                        if (!verifyAnchor) return@LaunchedEffect
+                    ChannelConversation("Public", displayed, {}, modifier, list, followLatest = !verifyAnchor)
+                    LaunchedEffect(verifyAnchor, verifyFollowLatest) {
+                        if (!verifyAnchor && !verifyFollowLatest) return@LaunchedEffect
                         val index = 30
                         val offset = 20
                         list.scrollToItem(index, offset)
@@ -79,10 +80,17 @@ class ScrollBenchmarkActivity : ComponentActivity() {
                         withTimeout(5_000) {
                             snapshotFlow { list.layoutInfo.totalItemsCount }.first { it == displayed.size }
                         }
-                        check(list.firstVisibleItemIndex == index + burst.size)
-                        check(list.firstVisibleItemScrollOffset == offset)
-                        check(list.layoutInfo.visibleItemsInfo.first { it.index == list.firstVisibleItemIndex }.key == key)
-                        Log.i("PocketScrollBenchmark", "250 appended messages kept the same anchor and offset")
+                        if (verifyAnchor) {
+                            check(list.firstVisibleItemIndex == index + burst.size)
+                            check(list.firstVisibleItemScrollOffset == offset)
+                            check(list.layoutInfo.visibleItemsInfo.first { it.index == list.firstVisibleItemIndex }.key == key)
+                            Log.i("PocketScrollBenchmark", "250 appended messages kept the same anchor and offset")
+                        } else {
+                            check(list.firstVisibleItemIndex == 0)
+                            check(list.firstVisibleItemScrollOffset == 0)
+                            check(list.layoutInfo.visibleItemsInfo.first { it.index == 0 }.key == burst.last().sequence)
+                            Log.i("PocketScrollBenchmark", "250 appended messages scrolled to the newest message")
+                        }
                     }
                 } else {
                     Box(modifier) {

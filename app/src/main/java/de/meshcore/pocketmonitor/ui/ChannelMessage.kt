@@ -1,5 +1,6 @@
 package de.meshcore.pocketmonitor.ui
 
+import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
 import de.meshcore.pocketmonitor.rx.OutgoingGroup
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -14,6 +15,8 @@ internal data class ChannelMessage(
     val receptionCount: Long = 1,
     val synchronized: Boolean = false,
     val outgoing: OutgoingGroup? = null,
+    val privateSend: PrivateSendStatus? = null,
+    val unread: Boolean = false,
 ) {
     val senderLabel: String get() = sender ?: "Unbekannter Absender"
     val receptionLabel: String get() {

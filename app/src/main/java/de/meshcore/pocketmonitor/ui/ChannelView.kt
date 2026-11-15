@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,6 +14,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -28,6 +31,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -38,18 +42,22 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import de.meshcore.pocketmonitor.ble.PrivateSender
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import androidx.lifecycle.repeatOnLifecycle
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
 import de.meshcore.pocketmonitor.rx.HistoryChannel
 import de.meshcore.pocketmonitor.rx.HistoryPage
 import de.meshcore.pocketmonitor.rx.MessageCursor
+import de.meshcore.pocketmonitor.rx.PRIVATE_ID_PREFIX
+import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
 import android.database.sqlite.SQLiteException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.text.Collator
 
 @Composable
 internal fun ChannelView(
@@ -58,7 +66,9 @@ internal fun ChannelView(
     connectionError: String?,
     modifier: Modifier = Modifier,
     privateMessages: Boolean = false,
+    unread: Set<String> = emptySet(),
 ) {
+    var order by remember(model, privateMessages) { mutableStateOf(model.conversationOrder(privateMessages)) }
     var selectedIdentity by rememberSaveable(companion) { mutableStateOf<String?>(null) }
     val conversationState = key(companion) { rememberSaveableStateHolder() }
     var previews by remember(companion) { mutableStateOf<List<ChannelPreview>?>(null) }
@@ -97,11 +107,24 @@ internal fun ChannelView(
             }
         }
     }
-    val channels = previews.orEmpty()
+    val privateSender = if (privateMessages) {
+        model.privateSender.collectAsStateWithLifecycle().value?.takeIf { it.companion == companion }
+    } else null
+    val channels = remember(previews, privateSender?.contacts, order, unread) {
+        val historical = previews.orEmpty()
+        val existing = historical.mapTo(mutableSetOf()) { it.channel.identity }
+        val new = privateSender?.contacts.orEmpty().mapNotNull { contact ->
+            val id = PRIVATE_ID_PREFIX + contact.publicKey
+            if (id in existing) null else ChannelPreview(
+                HistoryChannel(id, contact.name.ifBlank { contact.publicKey.take(12) }, null), null,
+            )
+        }
+        (historical + new).sortedWith(order.comparator(unread))
+    }
     val channel = channels.firstOrNull { it.channel.identity == selectedIdentity }?.channel
     val closeConversation = { selectedIdentity = null }
-    LaunchedEffect(previews, selectedIdentity) {
-        if (previews != null && channel == null) closeConversation()
+    LaunchedEffect(previews, channel) {
+        if (!privateMessages && previews != null && channel == null) closeConversation()
     }
     BackHandler(enabled = channel != null, onBack = closeConversation)
     Column(modifier) {
@@ -111,40 +134,48 @@ internal fun ChannelView(
         when {
             companion == null -> Text("Companion verbinden, um Nachrichten anzuzeigen.")
             channel != null -> conversationState.SaveableStateProvider("$companion/${channel.identity}") {
-                PagedConversation(model, companion, channel, closeConversation, Modifier.weight(1f), privateMessages)
+                PagedConversation(model, companion, channel, closeConversation, Modifier.weight(1f), privateMessages, privateSender)
             }
-            channels.isNotEmpty() -> LazyColumn {
-                items(channels, key = { it.channel.identity }) { (item, last) ->
-                    Column(
-                        Modifier.fillMaxWidth().clickable {
-                            selectedIdentity = item.identity
-                        }.padding(horizontal = 4.dp, vertical = 10.dp),
-                    ) {
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+            channels.isNotEmpty() -> {
+                val list = rememberLazyListState()
+                ConversationSortMenu(order) {
+                    order = it
+                    model.saveConversationOrder(privateMessages, it)
+                    list.requestScrollToItem(0)
+                }
+                LazyColumn(Modifier.weight(1f), state = list) {
+                    items(channels, key = { it.channel.identity }) { (item, last) ->
+                        Column(
+                            Modifier.fillMaxWidth().clickable {
+                                selectedIdentity = item.identity
+                            }.padding(horizontal = 4.dp, vertical = 10.dp),
                         ) {
-                            Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            when {
-                                privateMessages && channels.count { it.channel.name == item.name } > 1 ->
-                                    Text(item.identity.substringAfterLast(':').take(12), style = MaterialTheme.typography.labelSmall)
-                                privateMessages -> Unit
-                                item.slot == null && !item.identity.startsWith("slot:") -> Text("Archiv · ${item.identity.take(8)}", style = MaterialTheme.typography.labelSmall)
-                                item.slot != null && channels.count { it.channel.name == item.name } > 1 ->
-                                    Text("Slot ${item.slot}", style = MaterialTheme.typography.labelSmall)
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (item.identity in unread) UnreadDot()
+                                Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                when {
+                                    privateMessages ->
+                                        Text(item.identity.substringAfterLast(':').take(12), style = MaterialTheme.typography.labelSmall)
+                                    item.slot == null && !item.identity.startsWith("slot:") -> Text("Archiv · ${item.identity.take(8)}", style = MaterialTheme.typography.labelSmall)
+                                    item.slot != null && channels.count { it.channel.name == item.name } > 1 ->
+                                        Text("Slot ${item.slot}", style = MaterialTheme.typography.labelSmall)
+                                }
                             }
+                            Text(
+                                last?.let { if (it.sender == null) it.text else "${it.sender}: ${it.text}" }
+                                    ?: "Noch keine Nachrichten",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
-                        Text(
-                            last?.let { if (it.sender == null) it.text else "${it.sender}: ${it.text}" }
-                                ?: "Noch keine Nachrichten",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
+                        HorizontalDivider()
                     }
-                    HorizontalDivider()
                 }
             }
             else -> Text(when {
@@ -156,12 +187,42 @@ internal fun ChannelView(
     }
 }
 
-private data class ChannelPreview(val channel: HistoryChannel, val last: ChannelMessage?)
+internal data class ChannelPreview(val channel: HistoryChannel, val last: ChannelMessage?)
+
+internal enum class ConversationOrder(val label: String) {
+    ALPHABETICAL("A–Z"),
+    LAST_INCOMING("Letzter Eingang");
+
+    fun comparator(unread: Set<String>): Comparator<ChannelPreview> {
+        val collator = Collator.getInstance().apply { strength = Collator.PRIMARY }
+        val priority = compareByDescending<ChannelPreview> { it.channel.identity in unread }
+        val ordering = if (this == LAST_INCOMING) priority.thenByDescending { it.channel.lastIncoming }
+            else priority
+        return ordering.thenComparator { left, right -> collator.compare(left.channel.name, right.channel.name) }
+            .thenBy { it.channel.identity }
+    }
+}
+
+@Composable
+private fun ConversationSortMenu(order: ConversationOrder, select: (ConversationOrder) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { expanded = true }) { Text("Sortieren · ${order.label} ▾") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            ConversationOrder.entries.forEach { option ->
+                DropdownMenuItem(text = { Text(option.label) }, onClick = {
+                    select(option)
+                    expanded = false
+                })
+            }
+        }
+    }
+}
 
 @Composable
 private fun PagedConversation(
     model: MonitorViewModel, companion: String, channel: HistoryChannel, onBack: () -> Unit, modifier: Modifier,
-    privateMessages: Boolean,
+    privateMessages: Boolean, privateSender: PrivateSender?,
 ) {
     // Keep only one page of messages, plus the keys needed to navigate back.
     var boundaries by remember { mutableStateOf(listOf<MessageCursor?>(null)) }
@@ -178,7 +239,8 @@ private fun PagedConversation(
                 if (revision != current) {
                     try {
                         val updated = withContext(Dispatchers.IO) {
-                            model.channelMessages(companion, channel.identity, before, CHAT_PAGE_SIZE)
+                            model.channelMessages(companion, channel.identity, before, CHAT_PAGE_SIZE,
+                                includeUnreadThrough = true)
                         }
                         if (updated != page) page = updated
                         error = null
@@ -219,19 +281,43 @@ private fun PagedConversation(
             })
         }
     }
+    val unreadThrough = page?.unreadThrough
+    LaunchedEffect(lifecycle, unreadThrough, before) {
+        if (before != null || unreadThrough == null) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            try {
+                model.markConversationReadThrough(companion, channel.identity, unreadThrough)
+            } catch (_: SQLiteException) {
+                error = "Lesestatus konnte nicht gespeichert werden."
+            }
+        }
+    }
     Column(modifier) {
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         ChannelConversation(channel.name, page?.rows.orEmpty(), onBack, Modifier.weight(1f), list,
             backLabel = if (privateMessages) "‹ Privat" else "‹ Kanäle",
-            onOutgoingDetails = { detailId = it })
-        if (page?.hasOlder == true || before != null) {
+            followLatest = before == null,
+            onRead = if (before == null) null else { ids ->
+                try {
+                    model.markMessagesRead(companion, channel.identity, ids)
+                } catch (_: SQLiteException) {
+                    error = "Lesestatus konnte nicht gespeichert werden."
+                }
+            },
+            onOutgoingDetails = { detailId = it }, onReusePrivate = { message ->
+                draft = message.text
+                sendError = null
+            })
+        val hasNewer = before != null
+        val hasOlder = page?.hasOlder == true
+        if (!privateMessages || hasOlder || hasNewer) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (before != null) TextButton(onClick = {
+                if (!privateMessages || hasNewer) TextButton(enabled = hasNewer, onClick = {
                     boundaries = boundaries.dropLast(1)
                     page = null
                     list.requestScrollToItem(0)
                 }) { Text("Neuere") }
-                if (page?.hasOlder == true) TextButton(onClick = {
+                if (!privateMessages || hasOlder) TextButton(enabled = hasOlder, onClick = {
                     page?.rows?.firstOrNull()?.let {
                         boundaries = boundaries + MessageCursor(it.timestampSeconds, it.sequence)
                         page = null
@@ -240,7 +326,31 @@ private fun PagedConversation(
                 }) { Text("Ältere") }
             }
         }
-        if (!privateMessages) {
+        if (privateMessages) {
+            val key = channel.identity.removePrefix(PRIVATE_ID_PREFIX)
+            val eligible = privateSender?.takeIf { sender -> sender.contacts.any { it.publicKey == key } }
+            var retryOptions by remember(model, companion, key) {
+                mutableStateOf(model.privateRetryOptions(companion, key))
+            }
+            PrivateComposer(draft, { draft = it }, eligible, submitting, sendError, retryOptions, {
+                retryOptions = it
+                model.savePrivateRetryOptions(companion, key, it)
+            }) { text, options ->
+                val session = eligible?.session ?: return@PrivateComposer
+                if (submitting) return@PrivateComposer
+                submitting = true
+                sendError = null
+                model.sendPrivate(session, companion, key, text, options) { result ->
+                    submitting = false
+                    sendError = result
+                    if (result == null && draft == text) {
+                        draft = ""
+                        boundaries = listOf(null)
+                        list.requestScrollToItem(0)
+                    }
+                }
+            }
+        } else {
             GroupComposer(draft, { draft = it }, scope, { scope = it }, sender, submitting, sendError) { text, chosen ->
                 val session = sender?.session ?: return@GroupComposer
                 if (submitting) return@GroupComposer
@@ -268,23 +378,53 @@ internal fun ChannelConversation(
     modifier: Modifier = Modifier,
     list: LazyListState = rememberLazyListState(),
     backLabel: String = "‹ Kanäle",
+    followLatest: Boolean = true,
+    onRead: (suspend (List<Long>) -> Unit)? = null,
     onOutgoingDetails: ((Long) -> Unit)? = null,
+    onReusePrivate: ((ChannelMessage) -> Unit)? = null,
 ) {
     var displayed by remember { mutableStateOf(messages, referentialEqualityPolicy()) }
-    LaunchedEffect(messages, list) {
+    var pendingLatest by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(messages, list, followLatest) {
         if (messages === displayed) return@LaunchedEffect
         // Conflate UI updates through a drag/fling. The journal reader continues to advance.
         snapshotFlow { list.isScrollInProgress }.first { !it }
-        val index = list.firstVisibleItemIndex
-        val anchor = displayed.getOrNull(displayed.lastIndex - index)
-        if (anchor != null) {
-            val position = messages.binarySearch(anchor, channelMessageOrder)
+        val lastSequence = displayed.maxOfOrNull { it.sequence }
+        if (followLatest && lastSequence != null && messages.any { it.sequence > lastSequence }) {
+            list.requestScrollToItem(0)
+            pendingLatest = messages.last().sequence
+        } else {
+            val index = list.firstVisibleItemIndex
+            val anchor = displayed.getOrNull(displayed.lastIndex - index)
+            val position = anchor?.let { messages.binarySearch(it, channelMessageOrder) } ?: -1
             if (position >= 0 && messages.lastIndex - position != index) {
                 // The lazy list's local key lookup can miss an anchor after a large insertion.
                 list.requestScrollToItem(messages.lastIndex - position, list.firstVisibleItemScrollOffset)
             }
         }
         displayed = messages
+    }
+    LaunchedEffect(list, followLatest, pendingLatest) {
+        val latest = pendingLatest ?: return@LaunchedEffect
+        if (followLatest) {
+            // Let the new rows and the keyboard-adjusted viewport reach the lazy list first.
+            withFrameNanos { }
+            snapshotFlow { list.isScrollInProgress }.first { !it }
+            if (list.firstVisibleItemIndex != 0 || list.firstVisibleItemScrollOffset != 0 ||
+                list.layoutInfo.visibleItemsInfo.none { it.index == 0 && it.key == latest }
+            ) list.scrollToItem(0)
+        }
+        pendingLatest = null
+    }
+    if (onRead != null) {
+        val unreadIds = remember(displayed) { displayed.filter { it.unread }.map { it.sequence } }
+        val lifecycle = LocalLifecycleOwner.current.lifecycle
+        LaunchedEffect(lifecycle, unreadIds) {
+            if (unreadIds.isEmpty()) return@LaunchedEffect
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                onRead(unreadIds)
+            }
+        }
     }
     Column(modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -312,6 +452,22 @@ internal fun ChannelConversation(
                 verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom),
             ) {
                 items(newestFirst, key = { it.sequence }) { message ->
+                    val privateStatus = message.privateSend
+                    if (privateStatus != null) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            Column(outgoingBubble.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                ListRowText(message.text, messageStyle.copy(color = colors.onPrimaryContainer))
+                                ListRowText(message.timestampLabel, timeStyle.copy(color = colors.onPrimaryContainer))
+                                ListRowText(privateStatus.label, timeStyle.copy(color = colors.onPrimaryContainer))
+                                if (onReusePrivate != null && privateStatus != PrivateSendStatus.WAITING &&
+                                    privateStatus != PrivateSendStatus.ACCEPTED
+                                ) {
+                                    TextButton(onClick = { onReusePrivate(message) }) { Text("Nochmal senden") }
+                                }
+                            }
+                        }
+                        return@items
+                    }
                     val tx = message.outgoing
                     if (tx != null) {
                         val metadata = "${message.timestampLabel} · ${tx.repeats} Repeats"

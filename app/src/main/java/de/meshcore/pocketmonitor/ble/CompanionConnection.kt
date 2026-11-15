@@ -16,6 +16,15 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateRetry
+import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
+import de.meshcore.pocketmonitor.protocol.PrivateSend
+import de.meshcore.pocketmonitor.protocol.PrivateSendReceipt
+import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateSendStep
+import de.meshcore.pocketmonitor.protocol.HeardRepeater
+import de.meshcore.pocketmonitor.protocol.RepeaterAttribution
+import de.meshcore.pocketmonitor.protocol.RepeaterWindow
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
@@ -66,6 +75,30 @@ internal data class GroupSender(
     val busy: Boolean,
 )
 
+internal data class LiveRepeaterSnapshot(val companion: String, val rows: List<HeardRepeater>)
+
+internal data class PrivateSender(
+    val session: String,
+    val companion: String,
+    val contacts: List<CompanionContact>,
+    val textLimit: Int,
+    val busy: Boolean,
+)
+
+private class PrivateTransmission(
+    val id: Long, val key: String, val wireTime: Long, val text: ByteArray, val retry: PrivateRetry,
+) {
+    val wireKey = key.hexToByteArray()
+    var status = PrivateSendStatus.WAITING
+    var timer: Runnable? = null
+}
+
+private enum class PrivateStage { RESTORE_SCOPE, RESET_PATH, SEND }
+private class PrivateCommand(val stage: PrivateStage, command: ByteArray) {
+    val reply = CompanionRead(command, if (stage == PrivateStage.SEND) PrivateSend.SENT else CompanionProtocol.OK)
+    val earlyAcks = mutableSetOf<Long>()
+}
+
 private enum class GroupStage { PREPARE, SEND, RESTORE }
 
 private class GroupTransaction(
@@ -97,6 +130,10 @@ internal class CompanionConnection(private val context: Context, private val his
     val status = mutableStatus.asStateFlow()
     private val mutableGroupSender = MutableStateFlow<GroupSender?>(null)
     val groupSender = mutableGroupSender.asStateFlow()
+    private val mutablePrivateSender = MutableStateFlow<PrivateSender?>(null)
+    val privateSender = mutablePrivateSender.asStateFlow()
+    private val mutableLiveRepeaters = MutableStateFlow<LiveRepeaterSnapshot?>(null)
+    val liveRepeaters = mutableLiveRepeaters.asStateFlow()
     private val searches = DiscoverSearches()
     val discover = searches.history
 
@@ -144,6 +181,15 @@ internal class CompanionConnection(private val context: Context, private val his
         handler.post { current?.sendDiscover() }
     }
 
+    fun sendPrivate(session: String, companion: String, key: String, text: String,
+                    options: PrivateRetryOptions, completed: (String?) -> Unit) {
+        handler.post {
+            val connection = current
+            if (connection == null) completed("Companion ist getrennt.")
+            else connection.sendPrivate(session, companion, key, text, options, completed)
+        }
+    }
+
     fun sendGroup(session: String, companion: String, channel: String, text: String, scope: String,
                   completed: (String?) -> Unit) {
         handler.post {
@@ -166,6 +212,15 @@ internal class CompanionConnection(private val context: Context, private val his
         private var journalName: String? = null
         private var selfName: ByteArray? = null
         private var group: GroupTransaction? = null
+        private var privateTx: PrivateTransmission? = null
+        private var privateCommand: PrivateCommand? = null
+        private var privateCommandTimeout: Runnable? = null
+        private var sendableContacts = emptyList<CompanionContact>()
+        private val stalePrivatePrefixes = mutableSetOf<String>()
+        private var repeaterAttribution = RepeaterAttribution(emptyList())
+        private val repeaterWindow = RepeaterWindow()
+        private var repeaterPublishPending = false
+        private val publishRepeaters = Runnable { publishRepeaterWindow() }
         private var groupBlocked = false
         private val writer = ReceptionWriter(history, previousWriter, onIdentified = { identified ->
             handler.post { if (current === this) mutableCompanion.value = identified }
@@ -271,6 +326,15 @@ internal class CompanionConnection(private val context: Context, private val his
             gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
         ) = guarded {
             if (characteristic.uuid != CompanionProtocol.radioRx) return@guarded
+            privateCommand?.let { command ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    command.reply.acknowledgeWrite()
+                    privateProgress(command)
+                } else {
+                    finish("BLE-Schreibbestätigung für PM fehlgeschlagen.", error = true)
+                }
+                return@guarded
+            }
             group?.let { tx ->
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     tx.reply.acknowledgeWrite()
@@ -371,10 +435,27 @@ internal class CompanionConnection(private val context: Context, private val his
                     finish("RX-Journal konnte ein Ereignis nicht übernehmen. Empfang beendet.", error = true)
                     return@guarded
                 }
+                if (journalName != null && frame.code == CompanionProtocol.RF_LOG) {
+                    repeaterAttribution.receive(frame.bytes, frame.timeMs, elapsedMs)?.let {
+                        repeaterWindow.add(it)
+                        if (!repeaterPublishPending) {
+                            repeaterPublishPending = true
+                            handler.removeCallbacks(publishRepeaters)
+                            handler.postDelayed(publishRepeaters, 200)
+                        }
+                    }
+                }
                 searches.receive(discoverSession, frame, elapsedMs)
+                PrivateSend.changedContact(frame.bytes)?.let { invalidatePrivateContact(it, frame.code) }
+                receivePrivatePush(frame)
                 if (frame.code == QueuedMessage.WAITING && frame.bytes.size == 1) {
                     messagesWaiting = true
                     handler.post(resumeMessageSync)
+                }
+                privateCommand?.let { command ->
+                    command.reply.receive(frame.bytes)
+                    privateProgress(command)
+                    return@guarded
                 }
                 group?.let { tx ->
                     tx.reply.receive(frame.bytes)
@@ -455,7 +536,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
             if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null || messageSync != null ||
-                searches.history.value.busy || group != null || commandChannelUncertain) {
+                searches.history.value.busy || group != null || privateCommand != null || commandChannelUncertain) {
                 return@guarded
             }
             val transfer = ContactListTransfer()
@@ -482,6 +563,9 @@ internal class CompanionConnection(private val context: Context, private val his
                         return
                     }
                     contactsByPrefix = contacts.book?.list?.contacts.orEmpty().groupBy { it.publicKey.take(12) }
+                    stalePrivatePrefixes.clear()
+                    updateSendableContacts()
+                    repeaterAttribution = RepeaterAttribution(contacts.book?.list?.contacts.orEmpty())
                     journalName?.let { searches.updateResolver(discoverSession, contacts.resolverFor(it)) }
                 }
                 publishContacts(contacts)
@@ -508,6 +592,16 @@ internal class CompanionConnection(private val context: Context, private val his
             publishContacts(mutableStatus.value.contacts.copy(canRefresh = false, loading = false, error = message))
         }
 
+        private fun publishRepeaterWindow() {
+            repeaterPublishPending = false
+            val id = journalName ?: return
+            val now = SystemClock.elapsedRealtime()
+            mutableLiveRepeaters.value = LiveRepeaterSnapshot(id, repeaterWindow.snapshot(now))
+            repeaterWindow.nextExpiry()?.let { expiry ->
+                handler.postDelayed(publishRepeaters, maxOf(expiry - now, 200))
+            }
+        }
+
         private fun publishContacts(contacts: ContactStatus) {
             publishGroupSender()
             mutableStatus.value = mutableStatus.value.copy(
@@ -526,7 +620,7 @@ internal class CompanionConnection(private val context: Context, private val his
 
         fun refreshChannels() = guarded {
             val connection = gatt ?: return@guarded
-            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain || group != null ||
+            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain || group != null || privateCommand != null ||
                 channelQuery != null || telemetryQuery != null || contactTransfer != null || messageSync != null ||
                 searches.history.value.busy
             ) return@guarded
@@ -610,7 +704,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return
             if (initialTelemetryPending || !messagesWaiting || messageSync != null || !mutableStatus.value.active || initialMetadataPending ||
                 channelQuery != null || contactTransfer != null || telemetryQuery != null ||
-                searches.history.value.busy || group != null || commandChannelUncertain
+                searches.history.value.busy || group != null || privateCommand != null || commandChannelUncertain
             ) return
             if (mtu < CompanionProtocol.FULL_FRAME_MTU) {
                 messagesWaiting = false
@@ -688,7 +782,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return@guarded
             if (commandChannelUncertain) return@guarded
             if (contactTransfer != null || channelQuery != null || messageSync != null || telemetryQuery != null ||
-                searches.history.value.busy || group != null
+                searches.history.value.busy || group != null || privateCommand != null
             ) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
@@ -756,14 +850,219 @@ internal class CompanionConnection(private val context: Context, private val his
         private fun publishGroupSender() {
             val catalog = channelCatalog
             val id = journalName
+            mutablePrivateSender.value = if (id != null && mutableStatus.value.active &&
+                !commandChannelUncertain && sendableContacts.isNotEmpty()
+            ) {
+                PrivateSender(discoverSession, id, sendableContacts, PrivateSend.textLimit(mtu),
+                    privateTx != null || commandBusy())
+            } else null
             mutableGroupSender.value = if (id != null && catalog?.complete == true && !groupBlocked &&
                 !commandChannelUncertain && mutableStatus.value.active
             ) {
                 GroupSender(discoverSession, id, catalog.slots.mapTo(mutableSetOf()) { it.channel.identity },
                     GroupSend.scopeOptions(firmwareVersion ?: 0), GroupSend.textLimit(mtu),
-                    group != null || contactTransfer != null || channelQuery != null || telemetryQuery != null ||
-                        messageSync != null || searches.history.value.busy)
+                    commandBusy())
             } else null
+        }
+
+        private fun invalidatePrivateContact(key: String, code: Int?) {
+            val prefix = key.take(12)
+            val currentContact = PrivateSend.contact(key, contactsByPrefix)
+            val stale = if (code == PrivateSend.CONTACT_DELETED) currentContact != null
+                else currentContact == null && prefix in contactsByPrefix
+            if (stale && stalePrivatePrefixes.add(prefix)) {
+                updateSendableContacts()
+                publishGroupSender()
+            }
+        }
+
+        private fun updateSendableContacts() {
+            sendableContacts = contactsByPrefix.entries.mapNotNull { (prefix, matches) ->
+                matches.singleOrNull()?.takeUnless { prefix in stalePrivatePrefixes }
+            }
+        }
+
+        private fun privateContact(key: String): CompanionContact? =
+            PrivateSend.contact(key, contactsByPrefix)?.takeUnless { key.take(12) in stalePrivatePrefixes }
+
+        private fun commandBusy(): Boolean = pending != null || initialMetadataPending || initialTelemetryPending ||
+            group != null || privateCommand != null || contactTransfer != null || channelQuery != null ||
+            telemetryQuery != null || messageSync != null || searches.history.value.busy
+
+        fun sendPrivate(session: String, companion: String, key: String, text: String,
+                        options: PrivateRetryOptions, completed: (String?) -> Unit) = guarded {
+            val sender = mutablePrivateSender.value
+            val contact = privateContact(key)
+            if (sender == null || sender.session != session || sender.companion != companion ||
+                contact == null || privateTx != null || commandBusy() || commandChannelUncertain
+            ) {
+                completed("Kontakt oder Companion derzeit nicht sendebereit.")
+                return@guarded
+            }
+            val bytes = GroupSend.textBytes(text)
+            if (bytes == null || bytes.size > sender.textLimit) {
+                completed("Text ist leer, ungültig oder zu lang.")
+                return@guarded
+            }
+            try {
+                val (id, timestamp) = history.beginPrivate(companion, contact, text, System.currentTimeMillis())
+                val tx = PrivateTransmission(id, key, timestamp, bytes, PrivateRetry(options))
+                privateTx = tx
+                publishContacts(mutableStatus.value.contacts)
+                completed(null)
+                advancePrivate(tx)
+            } catch (_: SQLiteException) {
+                if (privateTx == null) completed("Private Nachricht konnte nicht gespeichert werden.")
+                else finish("PM-Sendestatus konnte nicht gespeichert werden.", error = true)
+            }
+        }
+
+        private fun advancePrivate(tx: PrivateTransmission) {
+            if (privateTx !== tx) return
+            val step = tx.retry.next()
+            if (step == PrivateSendStep.DONE || commandChannelUncertain) {
+                completePrivate(tx, if (tx.retry.acknowledged) PrivateSendStatus.ACKNOWLEDGED else PrivateSendStatus.UNKNOWN)
+                return
+            }
+            if (commandBusy()) {
+                schedulePrivate(tx, 500)
+                return
+            }
+            if (privateContact(tx.key) == null) {
+                completePrivate(tx, if (tx.retry.attempt == 0) PrivateSendStatus.FAILED else PrivateSendStatus.UNKNOWN)
+                return
+            }
+            when {
+                history.groupScopeDirty(checkNotNull(journalName)) -> {
+                    if ((firmwareVersion ?: 0) < GroupSend.SCOPE_MIN_VERSION) {
+                        completePrivate(tx, if (tx.retry.attempt == 0) PrivateSendStatus.FAILED else PrivateSendStatus.UNKNOWN)
+                    } else {
+                        writePrivate(tx, PrivateStage.RESTORE_SCOPE, GroupSend.restoreScope)
+                    }
+                }
+                step == PrivateSendStep.RESET_PATH ->
+                    writePrivate(tx, PrivateStage.RESET_PATH, PrivateSend.resetPath(tx.key))
+                else -> writePrivate(tx, PrivateStage.SEND, PrivateSend.command(tx.key, tx.wireTime, tx.retry.attempt, tx.text))
+            }
+        }
+
+        private fun writePrivate(tx: PrivateTransmission, stage: PrivateStage, bytes: ByteArray) {
+            val connection = checkNotNull(gatt)
+            val command = PrivateCommand(stage, bytes)
+            privateCommand = command
+            if (stage == PrivateStage.SEND && tx.status == PrivateSendStatus.WAITING) {
+                // From the moment the BLE write is attempted a disconnect can leave acceptance uncertain.
+                tx.status = PrivateSendStatus.UNKNOWN
+            }
+            if (!write(connection, command.reply.command)) {
+                clearPrivateCommand()
+                failPrivate(tx)
+                return
+            }
+            privateCommandTimeout = Runnable {
+                finish("Zeitüberschreitung bei der PM-Companion-Antwort.", error = true)
+            }.also { handler.postDelayed(it, 5_000) }
+            publishContacts(mutableStatus.value.contacts)
+        }
+
+        private fun receivePrivatePush(frame: RxFrame) {
+            val tx = privateTx ?: return
+            if (frame.code == PrivateSend.PATH_UPDATED && frame.bytes.size == 33 &&
+                tx.wireKey.indices.all { tx.wireKey[it] == frame.bytes[it + 1] }
+            ) tx.retry.pathUpdated()
+            val token = PrivateSend.ack(frame.bytes) ?: return
+            tx.retry.acknowledge(token)
+            val command = privateCommand
+            if (command == null && tx.retry.acknowledged) {
+                completePrivate(tx, PrivateSendStatus.ACKNOWLEDGED)
+            } else if (command?.stage == PrivateStage.SEND && command.earlyAcks.size < 32) {
+                command.earlyAcks.add(token)
+            }
+        }
+
+        private fun privateProgress(command: PrivateCommand) {
+            val frame = command.reply.result ?: return
+            val tx = checkNotNull(privateTx)
+            val code = frame[0].toInt() and 0xff
+            clearPrivateCommand()
+            try {
+                if ((code == CompanionProtocol.ERROR && frame.size in 1..2) ||
+                    (code == CompanionProtocol.DISABLED && frame.size == 1)
+                ) {
+                    failPrivate(tx)
+                    return
+                }
+                if (command.stage == PrivateStage.SEND) {
+                    val receipt = PrivateSendReceipt.decode(frame)
+                    if (receipt == null || receipt.estimateMs !in 1..600_000) {
+                        finish("Ungültige PM-Sendeantwort vom Companion.", error = true)
+                        return
+                    }
+                    tx.retry.receipt(receipt)
+                    command.earlyAcks.forEach(tx.retry::acknowledge)
+                    if (tx.retry.acknowledged) {
+                        completePrivate(tx, PrivateSendStatus.ACKNOWLEDGED)
+                        return
+                    }
+                    tx.status = PrivateSendStatus.ACCEPTED
+                    history.updatePrivate(tx.id, tx.status)
+                    schedulePrivate(tx, receipt.waitMs)
+                } else {
+                    if (code != CompanionProtocol.OK || frame.size != 1) {
+                        finish("Ungültige PM-Konfigurationsantwort vom Companion.", error = true)
+                        return
+                    }
+                    when (command.stage) {
+                        PrivateStage.RESTORE_SCOPE -> history.setGroupScopeDirty(checkNotNull(journalName), false)
+                        PrivateStage.RESET_PATH -> tx.retry.pathReset()
+                        PrivateStage.SEND -> error("PM-Sendestufe bereits verarbeitet")
+                    }
+                    schedulePrivate(tx, 150)
+                }
+                publishContacts(mutableStatus.value.contacts)
+                handler.post(resumeMessageSync)
+            } catch (_: SQLiteException) {
+                finish("PM-Sendestatus konnte nicht gespeichert werden.", error = true)
+            }
+        }
+
+        private fun schedulePrivate(tx: PrivateTransmission, delayMs: Long) {
+            tx.timer?.let(handler::removeCallbacks)
+            tx.timer = Runnable {
+                guarded {
+                    try {
+                        advancePrivate(tx)
+                    } catch (_: SQLiteException) {
+                        finish("PM-Sendestatus konnte nicht gespeichert werden.", error = true)
+                    }
+                }
+            }.also { handler.postDelayed(it, delayMs) }
+        }
+
+        private fun clearPrivateCommand() {
+            privateCommand = null
+            privateCommandTimeout?.let(handler::removeCallbacks)
+            privateCommandTimeout = null
+        }
+
+        private fun failPrivate(tx: PrivateTransmission) = completePrivate(tx, when {
+            tx.retry.acknowledged -> PrivateSendStatus.ACKNOWLEDGED
+            tx.retry.attempt == 0 -> PrivateSendStatus.FAILED
+            else -> PrivateSendStatus.UNKNOWN
+        })
+
+        private fun completePrivate(tx: PrivateTransmission, status: PrivateSendStatus) {
+            tx.timer?.let(handler::removeCallbacks)
+            tx.status = status
+            try {
+                history.updatePrivate(tx.id, status)
+            } catch (_: SQLiteException) {
+                finish("PM-Sendestatus konnte nicht gespeichert werden.", error = true)
+                return
+            }
+            privateTx = null
+            publishContacts(mutableStatus.value.contacts)
+            handler.post(resumeMessageSync)
         }
 
         fun sendGroup(session: String, companion: String, identity: String, text: String, scope: String,
@@ -899,6 +1198,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private fun discoverUnavailable(): String? = when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
             group != null -> "Kanalnachricht wird gesendet …"
+            privateCommand != null -> "Private Nachricht wird an den Companion übergeben …"
             discoverDisabled != null -> discoverDisabled
             firmwareVersion == null -> "Companion-Protokollversion für DISCOVER fehlt."
             (firmwareVersion ?: 0) < CompanionProtocol.DISCOVER_MIN_VERSION ->
@@ -1023,7 +1323,21 @@ internal class CompanionConnection(private val context: Context, private val his
         fun finish(message: String, error: Boolean = false) {
             if (current !== this) return
             current = null
+            handler.removeCallbacks(publishRepeaters)
+            mutableLiveRepeaters.value = null
             mutableGroupSender.value = null
+            mutablePrivateSender.value = null
+            clearPrivateCommand()
+            privateTx?.let { tx ->
+                tx.timer?.let(handler::removeCallbacks)
+                val status = when {
+                    tx.retry.acknowledged -> PrivateSendStatus.ACKNOWLEDGED
+                    tx.status == PrivateSendStatus.WAITING -> PrivateSendStatus.FAILED
+                    else -> PrivateSendStatus.UNKNOWN
+                }
+                runCatching { history.updatePrivate(tx.id, status) }
+            }
+            privateTx = null
             group?.let { tx ->
                 recordGroupResult(tx)
                 tx.completed(message)

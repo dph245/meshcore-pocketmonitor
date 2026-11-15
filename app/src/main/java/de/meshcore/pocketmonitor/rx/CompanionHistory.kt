@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.ChannelSlot
@@ -24,8 +25,12 @@ import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
 internal data class KnownCompanion(val id: String, val name: String)
-internal data class HistoryChannel(val identity: String, val name: String, val slot: Int?)
-internal data class HistoryPage<T>(val rows: List<T>, val hasOlder: Boolean)
+internal data class HistoryChannel(
+    val identity: String, val name: String, val slot: Int?, val lastIncoming: Long? = null,
+)
+internal data class HistoryPage<T>(
+    val rows: List<T>, val hasOlder: Boolean, val unreadThrough: Long? = null,
+)
 internal data class MessageCursor(val time: Long, val id: Long)
 internal data class Received(val ordinal: Long, val frame: RxFrame)
 internal data class DecodedMessage(
@@ -33,7 +38,7 @@ internal data class DecodedMessage(
     val comparison: String,
 )
 
-private const val PRIVATE_ID_PREFIX = "pm:"
+internal const val PRIVATE_ID_PREFIX = "pm:"
 
 internal const val LIVE_PAGE_SIZE = 500
 internal const val CHAT_PAGE_SIZE = 200
@@ -86,12 +91,20 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 SELECT 1 FROM message WHERE message.companion = channel.companion AND message.channel = channel.identity
             ))
         """
+        val lastIncoming = if (currentOnly) "NULL" else """
+            (SELECT id FROM message WHERE message.companion = channel.companion
+              AND message.channel = channel.identity AND substr(comparison, 1, 3) <> 'tx:'
+              ORDER BY id DESC LIMIT 1)
+        """
         return db.rawQuery("""
-            SELECT identity, name, slot FROM channel WHERE companion = ? AND $visible
+            SELECT identity, name, slot, $lastIncoming FROM channel WHERE companion = ? AND $visible
                 AND identity ${if (private) "LIKE" else "NOT LIKE"} '${PRIVATE_ID_PREFIX}%'
             ORDER BY slot IS NULL, slot, name, identity
         """, arrayOf(companion)).use { cursor ->
-            cursor.collect { HistoryChannel(getString(0), getString(1), if (isNull(2)) null else getInt(2)) }
+            cursor.collect {
+                HistoryChannel(getString(0), getString(1), if (isNull(2)) null else getInt(2),
+                    if (isNull(3)) null else getLong(3))
+            }
         }
     }
 
@@ -110,6 +123,34 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     fun updateGroup(id: Long, status: GroupSendStatus) {
         GroupHistory(db).update(id, status)
+        changes.incrementAndGet()
+    }
+
+    fun beginPrivate(companion: String, contact: CompanionContact, text: String, now: Long): Pair<Long, Long> {
+        val database = db
+        val send = database.inTransaction {
+            val wireTime = GroupHistory(database).wireTime(companion, now)
+            val channel = HistoryChannel(PRIVATE_ID_PREFIX + contact.publicKey,
+                contact.name.ifBlank { contact.publicKey.take(12) }, null)
+            insertChannel(database, companion, channel)
+            val id = database.insertOrThrow("message", null, ContentValues().apply {
+                put("companion", companion)
+                put("channel", channel.identity)
+                put("comparison", "tx:${java.util.UUID.randomUUID()}")
+                put("sent_at", now / 1000)
+                put("body", text)
+            })
+            database.execSQL("INSERT INTO private_send VALUES (?, ?, ?)",
+                arrayOf<Any>(id, now, PrivateSendStatus.WAITING.name))
+            database.execSQL("UPDATE companion SET group_wire_time = ? WHERE id = ?", arrayOf<Any>(wireTime, companion))
+            id to wireTime
+        }
+        changes.incrementAndGet()
+        return send
+    }
+
+    fun updatePrivate(id: Long, status: PrivateSendStatus) {
+        db.execSQL("UPDATE private_send SET status = ? WHERE message_id = ?", arrayOf<Any>(status.name, id))
         changes.incrementAndGet()
     }
 
@@ -186,8 +227,43 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         return JournalSnapshot(companion, count, raw.rows, radio.rows, error, raw.hasOlder, radio.hasOlder, revision, before)
     }
 
-    fun messages(companion: String, identity: String, before: MessageCursor?, limit: Int = CHAT_PAGE_SIZE):
-        HistoryPage<ChannelMessage> {
+    fun unreadConversations(): Map<String, Set<String>> {
+        val result = mutableMapOf<String, MutableSet<String>>()
+        db.rawQuery("SELECT DISTINCT companion, channel FROM message WHERE unread = 1", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                result.getOrPut(cursor.getString(0)) { mutableSetOf() }.add(cursor.getString(1))
+            }
+        }
+        return result
+    }
+
+    fun markRead(companion: String, channel: String, ids: List<Long>) {
+        if (ids.isEmpty()) return
+        val placeholders = ids.joinToString(",") { "?" }
+        val changed = db.update("message", ContentValues().apply { put("unread", 0) },
+            "companion = ? AND channel = ? AND unread = 1 AND id IN ($placeholders)",
+            (listOf(companion, channel) + ids.map(Long::toString)).toTypedArray())
+        if (changed > 0) changes.incrementAndGet()
+    }
+
+    fun markReadThrough(companion: String, channel: String, through: Long) {
+        val changed = db.update("message", ContentValues().apply { put("unread", 0) },
+            "companion = ? AND channel = ? AND unread = 1 AND id <= ?",
+            arrayOf(companion, channel, through.toString()))
+        if (changed > 0) changes.incrementAndGet()
+    }
+
+    fun messages(
+        companion: String, identity: String, before: MessageCursor?, limit: Int = CHAT_PAGE_SIZE,
+        includeUnreadThrough: Boolean = false,
+    ): HistoryPage<ChannelMessage> {
+        // Capture the receipt boundary first so a concurrent arrival stays unread until loaded.
+        val unreadThrough = if (includeUnreadThrough && before == null) {
+            db.rawQuery("SELECT max(id) FROM message WHERE companion = ? AND channel = ? AND unread = 1",
+                arrayOf(companion, identity)).use {
+                if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else null
+            }
+        } else null
         val args = arrayListOf(companion, identity)
         val boundary = if (before == null) "" else {
             args.addAll(listOf(before.time.toString(), before.id.toString()))
@@ -199,8 +275,9 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 group_send.scope, group_send.status, group_send.channel_name, group_send.created_at,
                 CASE WHEN group_send.message_id IS NOT NULL THEN
                     (SELECT count(*) FROM group_repeat WHERE send_id = message.id)
-                END
+                END, private_send.status, message.unread
             FROM message LEFT JOIN group_send ON group_send.message_id = message.id
+                LEFT JOIN private_send ON private_send.message_id = message.id
             WHERE message.companion = ? AND channel = ? $boundary
             ORDER BY sent_at DESC, id DESC LIMIT ${limit + 1}
         """, args.toTypedArray()).use { cursor ->
@@ -209,10 +286,11 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 ChannelMessage(getLong(0), getString(1), time, getString(3), clock.format(Instant.ofEpochSecond(time)),
                     getString(4), getLong(5), getLong(6) > 0,
                     if (isNull(7)) null else OutgoingGroup(getString(7), GroupSendStatus.valueOf(getString(8)),
-                        getLong(11), getString(9), getLong(10)))
+                        getLong(11), getString(9), getLong(10)),
+                    getString(12)?.let(PrivateSendStatus::valueOf), getInt(13) != 0)
             }
         }
-        return HistoryPage(rows.take(limit).asReversed(), rows.size > limit)
+        return HistoryPage(rows.take(limit).asReversed(), rows.size > limit, unreadThrough)
     }
 
     fun prune(now: Long = System.currentTimeMillis()) {
@@ -232,7 +310,9 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         }
         val expired = database.delete("message", "id IN (SELECT message_id FROM group_send WHERE created_at < ?)",
             arrayOf((now - HISTORY_AGE_MS).toString()))
-        if (expired > 0) changes.incrementAndGet()
+        val expiredPrivate = database.delete("message", "id IN (SELECT message_id FROM private_send WHERE created_at < ?)",
+            arrayOf((now - HISTORY_AGE_MS).toString()))
+        if (expired + expiredPrivate > 0) changes.incrementAndGet()
         database.execSQL("""
             DELETE FROM channel WHERE slot IS NULL AND NOT EXISTS (
                 SELECT 1 FROM message WHERE message.companion = channel.companion AND message.channel = channel.identity
@@ -250,7 +330,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         val database = db
         database.inTransaction {
             register(database, companion.id, companion.name, time)
-            insertBatch(database, companion.id, session, frames, decoded)
+            insertBatch(database, companion.id, session, frames, decoded, unread = false)
             database.execSQL("INSERT OR REPLACE INTO legacy_import VALUES (?, ?)", arrayOf<Any>(session, ordinal))
         }
         changes.incrementAndGet()
@@ -289,7 +369,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     private fun insertBatch(database: SQLiteDatabase, companion: String, session: String,
                             frames: List<Received>, decoded: List<DecodedMessage?>,
-                            trackRepeats: Boolean = false, linkQueued: ((Long) -> Unit)? = null): Boolean {
+                            trackRepeats: Boolean = false, unread: Boolean = true, linkQueued: ((Long) -> Unit)? = null): Boolean {
         val group = GroupHistory(database).takeIf { trackRepeats }
         var inserted = false
         database.compileStatement("""
@@ -306,7 +386,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 if (id == -1L) continue
                 inserted = true
                 if (group?.linkRepeat(companion, id, item.frame) != true) {
-                    decoded[index]?.let { link(database, companion, id, it) }
+                    decoded[index]?.let { link(database, companion, id, it, unread) }
                 }
                 linkQueued?.invoke(id)
             }
@@ -319,7 +399,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
             arrayOf<Any?>(companion, channel.identity, channel.name, channel.slot))
     }
 
-    private fun link(database: SQLiteDatabase, companion: String, id: Long, message: DecodedMessage) {
+    private fun link(database: SQLiteDatabase, companion: String, id: Long, message: DecodedMessage, unread: Boolean = true) {
         val payload = message.payload
         // A concurrent retention pass or decode may already have handled this reception.
         val pending = database.rawQuery("SELECT 1 FROM rx WHERE id = ? AND companion = ? AND message_id IS NULL AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)",
@@ -340,7 +420,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 arrayOf<Any>(message.comparison, synchronized))
         }
         linkMessage(database, companion, id, channel, payload.sender, payload.timestampSeconds, payload.text,
-            message.comparison, synchronized)
+            message.comparison, synchronized, unread)
     }
 
     private fun linkQueued(database: SQLiteDatabase, companion: String, id: Long, queued: QueuedMessage,
@@ -382,7 +462,8 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     }
 
     private fun linkMessage(database: SQLiteDatabase, companion: String, rxId: Long, channel: HistoryChannel,
-                            sender: String?, time: Long, body: String, comparison: String, existing: Long? = null) {
+                            sender: String?, time: Long, body: String, comparison: String, existing: Long? = null,
+                            unread: Boolean = true) {
         val messageId = existing ?: run {
             insertChannel(database, companion, channel)
             val values = ContentValues().apply {
@@ -392,6 +473,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 put("sender", sender)
                 put("sent_at", time)
                 put("body", body)
+                put("unread", unread)
             }
             val inserted = database.insertWithOnConflict("message", null, values, SQLiteDatabase.CONFLICT_IGNORE)
             if (inserted != -1L) inserted else checkNotNull(messageId(database, companion, channel, comparison))

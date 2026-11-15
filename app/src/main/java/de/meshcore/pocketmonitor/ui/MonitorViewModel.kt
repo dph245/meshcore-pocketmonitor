@@ -1,6 +1,9 @@
 package de.meshcore.pocketmonitor.ui
 
 import android.app.Application
+import android.content.Context
+import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
+import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
@@ -33,6 +36,7 @@ internal data class ScanState(
 internal class MonitorViewModel(application: Application) : AndroidViewModel(application) {
     private val scanner = CompanionScanner(application)
     private val history = CompanionHistory.get(application)
+    private val preferences = application.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
     private val connection = CompanionConnection(application, history)
     private val mutableCompanions = MutableStateFlow<List<KnownCompanion>>(emptyList())
     val companions = mutableCompanions.asStateFlow()
@@ -47,6 +51,15 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val connectionStatus = connection.status
     val discover = connection.discover
     val groupSender = connection.groupSender
+    val privateSender = connection.privateSender
+    val liveRepeaters = connection.liveRepeaters
+
+    fun sendPrivate(session: String, companion: String, key: String, text: String,
+                    options: PrivateRetryOptions, completed: (String?) -> Unit) {
+        connection.sendPrivate(session, companion, key, text, options) { error ->
+            viewModelScope.launch { completed(error) }
+        }
+    }
 
     fun groupScope(companion: String, channel: String) = history.groupScope(companion, channel)
 
@@ -151,10 +164,55 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     val historyRevision: Long get() = history.revision
 
+    fun unreadConversations() = history.unreadConversations()
+
+    suspend fun markMessagesRead(companion: String, channel: String, ids: List<Long>) =
+        withContext(Dispatchers.IO) { history.markRead(companion, channel, ids) }
+
     fun historyChannels(companion: String, private: Boolean) = history.channels(companion, private = private)
 
-    fun channelMessages(companion: String, channel: String, before: MessageCursor?, limit: Int) =
-        history.messages(companion, channel, before, limit)
+    fun conversationOrder(privateMessages: Boolean): ConversationOrder {
+        val saved = preferences.getString(conversationOrderKey(privateMessages), null)
+        return ConversationOrder.entries.firstOrNull { it.name == saved } ?: ConversationOrder.ALPHABETICAL
+    }
+
+    fun saveConversationOrder(privateMessages: Boolean, order: ConversationOrder) {
+        preferences.edit { putString(conversationOrderKey(privateMessages), order.name) }
+    }
+
+    private fun conversationOrderKey(privateMessages: Boolean): String =
+        if (privateMessages) "private_order" else "channel_order"
+
+    fun privateRetryOptions(companion: String, contact: String): PrivateRetryOptions {
+        val key = privateRetryKey(companion, contact)
+        val defaults = PrivateRetryOptions()
+        return PrivateRetryOptions(
+            pathAttempts = preferences.getInt("$key/path", defaults.pathAttempts)
+                .takeIf { it in 1..3 } ?: defaults.pathAttempts,
+            floodAttempts = preferences.getInt("$key/flood", defaults.floodAttempts)
+                .takeIf { it in 1..3 } ?: defaults.floodAttempts,
+            resetPathForFlood = preferences.getBoolean("$key/reset_path", defaults.resetPathForFlood),
+        )
+    }
+
+    fun savePrivateRetryOptions(companion: String, contact: String, options: PrivateRetryOptions) {
+        val key = privateRetryKey(companion, contact)
+        preferences.edit {
+            putInt("$key/path", options.pathAttempts)
+            putInt("$key/flood", options.floodAttempts)
+            putBoolean("$key/reset_path", options.resetPathForFlood)
+        }
+    }
+
+    private fun privateRetryKey(companion: String, contact: String): String =
+        "private_retry/$companion/$contact"
+
+    suspend fun markConversationReadThrough(companion: String, channel: String, through: Long) =
+        withContext(Dispatchers.IO) { history.markReadThrough(companion, channel, through) }
+
+    fun channelMessages(
+        companion: String, channel: String, before: MessageCursor?, limit: Int, includeUnreadThrough: Boolean = false,
+    ) = history.messages(companion, channel, before, limit, includeUnreadThrough)
 
     // Called by the live view's single IO reader.
     private var publicChannels: Pair<String, List<HistoryChannel>>? = null

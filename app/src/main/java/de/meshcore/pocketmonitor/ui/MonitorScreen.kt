@@ -4,12 +4,18 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
@@ -25,6 +31,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -37,10 +44,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import de.meshcore.pocketmonitor.rx.PRIVATE_ID_PREFIX
+import android.database.sqlite.SQLiteException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun MonitorScreen(
     model: MonitorViewModel,
@@ -60,18 +79,45 @@ internal fun MonitorScreen(
     val liveList = rememberLazyListState()
     val liveState = remember(liveList) { LiveViewState(liveList) }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var selectedDiscoverTag by rememberSaveable { mutableStateOf<Long?>(null) }
     var showContacts by remember(contacts.journalName) { mutableStateOf(false) }
     var showConnectionControls by rememberSaveable { mutableStateOf(false) }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var unread by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    LaunchedEffect(model, lifecycle, historyReady) {
+        if (!historyReady) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            var revision = -1L
+            while (isActive) {
+                val current = model.historyRevision
+                if (revision != current) {
+                    try {
+                        unread = withContext(Dispatchers.IO) { model.unreadConversations() }
+                        revision = current
+                    } catch (_: SQLiteException) {
+                        // Keep the last snapshot and retry on the next poll.
+                    }
+                }
+                delay(350)
+            }
+        }
+    }
+    val unreadHere = unread[companion].orEmpty()
     val channelTabConnected = selectedTab == 2 && connection.active && contacts.journalName != null
+    val editingMessage = selectedTab == 2 && WindowInsets.isImeVisible
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold { insets ->
             Column(
-                Modifier.fillMaxSize().padding(insets).padding(horizontal = 16.dp, vertical = 8.dp),
+                Modifier.fillMaxSize()
+                    .padding(insets)
+                    .consumeWindowInsets(insets)
+                    .imePadding()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (channelTabConnected) {
+                if (channelTabConnected && !editingMessage) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(connection.message, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -80,7 +126,7 @@ internal fun MonitorScreen(
                         }
                     }
                 }
-                if (!channelTabConnected || showConnectionControls) {
+                if (!editingMessage && (!channelTabConnected || showConnectionControls)) {
                     Text("MeshCore PocketMonitor", style = MaterialTheme.typography.titleLarge)
                     Text(
                         connection.message,
@@ -123,17 +169,18 @@ internal fun MonitorScreen(
                         Text("Display aktiv halten", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
-                if (!connection.active && companions.isNotEmpty()) {
+                if (!editingMessage && !connection.active && companions.isNotEmpty()) {
                     var expanded by remember { mutableStateOf(false) }
                     Box {
                         TextButton(onClick = { expanded = true }) {
                             val selected = companions.firstOrNull { it.id == companion }
-                            Text(selected?.let { "Historie: ${it.name} · ${it.id.take(8)}" } ?: "Historie auswählen")
+                            UnreadLabel(selected?.let { "Historie: ${it.name} · ${it.id.take(8)}" } ?: "Historie auswählen",
+                                unread.isNotEmpty())
                         }
                         DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
                             for (known in companions) {
                                 DropdownMenuItem(
-                                    text = { Text("${known.name} · ${known.id.take(8)}") },
+                                    text = { UnreadLabel("${known.name} · ${known.id.take(8)}", known.id in unread) },
                                     onClick = { model.selectHistory(known.id); expanded = false },
                                 )
                             }
@@ -141,17 +188,30 @@ internal fun MonitorScreen(
                     }
                 }
                 historyError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                SecondaryTabRow(selectedTabIndex = selectedTab) {
-                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Live-Funk") })
-                    Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("DISCOVER") })
-                    Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Nachrichten") })
+                if (!editingMessage) {
+                    SecondaryTabRow(selectedTabIndex = selectedTab) {
+                        Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Live-Funk") })
+                        Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("DISCOVER") })
+                        Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { UnreadLabel("Nachrichten", unreadHere.isNotEmpty()) })
+                    }
                 }
                 if (selectedTab == 0) {
-                    LiveView(model, companion, contacts, liveState, Modifier.weight(1f))
+                    SecondaryTabRow(selectedTabIndex = liveTab) {
+                        Tab(selected = liveTab == 0, onClick = { liveTab = 0 }, text = { Text("Empfang") })
+                        Tab(selected = liveTab == 1, onClick = { liveTab = 1 }, text = { Text("Repeater") })
+                    }
+                    if (liveTab == 0) {
+                        tabState.SaveableStateProvider("live-rx") {
+                            LiveView(model, companion, contacts, liveState, Modifier.weight(1f))
+                        }
+                    } else {
+                        LiveRepeaterView(model, companion, connection.active && contacts.journalName == companion,
+                            Modifier.weight(1f))
+                    }
                 } else if (selectedTab == 2) {
                     SecondaryTabRow(selectedTabIndex = messageTab) {
-                        Tab(selected = messageTab == 0, onClick = { messageTab = 0 }, text = { Text("Kanäle") })
-                        Tab(selected = messageTab == 1, onClick = { messageTab = 1 }, text = { Text("Privat") })
+                        Tab(selected = messageTab == 0, onClick = { messageTab = 0 }, text = { UnreadLabel("Kanäle", unreadHere.any { !it.startsWith(PRIVATE_ID_PREFIX) }) })
+                        Tab(selected = messageTab == 1, onClick = { messageTab = 1 }, text = { UnreadLabel("Privat", unreadHere.any { it.startsWith(PRIVATE_ID_PREFIX) }) })
                     }
                     if (connection.syncingMessages) {
                         Text("Nachrichten werden abgeglichen …", style = MaterialTheme.typography.bodySmall)
@@ -161,7 +221,7 @@ internal fun MonitorScreen(
                     }
                     tabState.SaveableStateProvider(if (messageTab == 0) "channels" else "private") {
                         ChannelView(model, companion, connection.channelError.takeIf { messageTab == 0 },
-                            Modifier.weight(1f), privateMessages = messageTab == 1)
+                            Modifier.weight(1f), privateMessages = messageTab == 1, unread = unreadHere)
                     }
                 } else {
                     DiscoverView(
@@ -179,6 +239,22 @@ internal fun MonitorScreen(
             ),
                 model::refreshContacts) { showContacts = false }
         }
+    }
+}
+
+@Composable
+internal fun UnreadDot() {
+    Badge(
+        modifier = Modifier.semantics { contentDescription = "Ungelesene Nachrichten" },
+        containerColor = if (isSystemInDarkTheme()) Color(0xFFFF6B6B) else Color(0xFFC62828),
+    )
+}
+
+@Composable
+private fun UnreadLabel(label: String, unread: Boolean) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label)
+        if (unread) UnreadDot()
     }
 }
 
