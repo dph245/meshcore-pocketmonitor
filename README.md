@@ -9,7 +9,9 @@ Native Android-App in Kotlin und Jetpack Compose. Die App verbindet sich per BLE
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-1. **Geräte suchen** startet einen bis zu zwölf Sekunden langen Scan nach connectable BLE-Geräten, die den Nordic UART Service ankündigen. Unter Android 12+ benötigt die App die Berechtigung für Geräte in der Nähe. Unter Android 8–11 erfordert der BLE-Scan präzisen Standort und einen aktivierten Systemstandort.
+Die kompakte Icon-Leiste enthält **Live-Funk** (Funkwellen), **DISCOVER** (Lupe), **Nachrichten** (Sprechblase) und **Verbindung** (Bluetooth). Langes Drücken zeigt den Namen; Screenreader lesen die Tab-Namen und ungelesenen Hinweise vor. Auch die Untertabs nutzen Icons. Beim ersten Öffnen erscheint **Verbindung** mit Gerätesuche, Verbinden/Trennen, Kontakten, Akku, Noise Floor und **Display aktiv halten**.
+
+1. Im Tab **Verbindung** startet **Geräte suchen** startet einen bis zu zwölf Sekunden langen Scan nach connectable BLE-Geräten, die den Nordic UART Service ankündigen. Unter Android 12+ benötigt die App die Berechtigung für Geräte in der Nähe. Unter Android 8–11 erfordert der BLE-Scan präzisen Standort und einen aktivierten Systemstandort.
 2. Gerät im Auswahlmenü wählen und **Verbinden** antippen. Wenn Android eine Kopplung verlangt, den PIN des Companions im Systemdialog eingeben.
 3. Nach dem Verbinden lädt die App die Kontakte. **Kontakte** zeigt Namen, Gerätetypen, die ersten drei Bytes der Public Keys und die Anzahl je vorhandenem Typ. **Aktualisieren** liest den gesamten Bestand erneut.
 4. **Live-Funk** zeigt die neuesten Funkpakete zuerst. Antippen öffnet die Paketdetails mit Hop-Präfixen, vollständigen Namen, Auflösungsstatus und vollständigem Hexdump. **Rohdaten** zeigt auch Companion-Antworten und unbekannte Events. **Pause** oder Ziehen an der Liste friert den sichtbaren Ausschnitt ein. **Fortsetzen** springt zu den neuesten Einträgen. **Trennen** schließt die GATT-Verbindung und lässt das Journal auslaufen.

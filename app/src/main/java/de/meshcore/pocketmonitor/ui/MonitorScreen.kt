@@ -1,6 +1,9 @@
 package de.meshcore.pocketmonitor.ui
 
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,8 +16,15 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Icon
+import androidx.compose.material3.PlainTooltip
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -41,6 +51,7 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -51,6 +62,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import de.meshcore.pocketmonitor.R
 import de.meshcore.pocketmonitor.rx.PRIVATE_ID_PREFIX
 import android.database.sqlite.SQLiteException
 import kotlinx.coroutines.Dispatchers
@@ -78,12 +90,11 @@ internal fun MonitorScreen(
     val tabState = rememberSaveableStateHolder()
     val liveList = rememberLazyListState()
     val liveState = remember(liveList) { LiveViewState(liveList) }
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(3) }
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var selectedDiscoverTag by rememberSaveable { mutableStateOf<Long?>(null) }
     var showContacts by remember(contacts.journalName) { mutableStateOf(false) }
-    var showConnectionControls by rememberSaveable { mutableStateOf(false) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var unread by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
     LaunchedEffect(model, lifecycle, historyReady) {
@@ -105,7 +116,6 @@ internal fun MonitorScreen(
         }
     }
     val unreadHere = unread[companion].orEmpty()
-    val channelTabConnected = selectedTab == 2 && connection.active && contacts.journalName != null
     val editingMessage = selectedTab == 2 && WindowInsets.isImeVisible
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
         Scaffold { insets ->
@@ -117,56 +127,64 @@ internal fun MonitorScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (channelTabConnected && !editingMessage) {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(connection.message, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        TextButton(onClick = { showConnectionControls = !showConnectionControls }) {
-                            Text(if (showConnectionControls) "Einklappen" else "Verbindung")
-                        }
-                    }
-                }
-                if (!editingMessage && (!channelTabConnected || showConnectionControls)) {
-                    Text("MeshCore PocketMonitor", style = MaterialTheme.typography.titleLarge)
-                    Text(
-                        connection.message,
-                        color = if (connection.error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                if (!editingMessage) {
+                    IconTabRow(
+                        selectedTab, { selectedTab = it },
+                        listOf(
+                            MonitorTab("Live-Funk", R.drawable.ic_tab_radio),
+                            MonitorTab("DISCOVER", R.drawable.ic_tab_discover),
+                            MonitorTab("Nachrichten", R.drawable.ic_tab_messages, unreadHere.isNotEmpty()),
+                            MonitorTab("Verbindung", R.drawable.ic_tab_bluetooth),
+                        ),
+                        Modifier.align(Alignment.CenterHorizontally),
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = if (scan.scanning) model::stopScan else onScan,
-                            enabled = !connection.active,
-                        ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
-                        Button(
-                            onClick = if (connection.active) model::disconnect else model::connect,
-                            enabled = connection.active || (historyReady && scan.selected != null),
-                        ) { Text(if (connection.active) "Trennen" else "Verbinden") }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.weight(1f)) {
-                            DeviceMenu(scan, enabled = !connection.active, model = model)
+                }
+                if (selectedTab == 3) {
+                    Column(
+                        Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("MeshCore PocketMonitor", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            connection.message,
+                            color = if (connection.error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = if (scan.scanning) model::stopScan else onScan,
+                                enabled = !connection.active,
+                            ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
+                            Button(
+                                onClick = if (connection.active) model::disconnect else model::connect,
+                                enabled = connection.active || (historyReady && scan.selected != null),
+                            ) { Text(if (connection.active) "Trennen" else "Verbinden") }
                         }
-                        if (contacts.journalName != null) {
-                            OutlinedButton(onClick = { showContacts = true }) {
-                                Text(contacts.book?.let { "Kontakte (${it.list.contacts.size})" } ?: "Kontakte")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.weight(1f)) {
+                                DeviceMenu(scan, enabled = !connection.active, model = model)
+                            }
+                            if (contacts.journalName != null) {
+                                OutlinedButton(onClick = { showContacts = true }) {
+                                    Text(contacts.book?.let { "Kontakte (${it.list.contacts.size})" } ?: "Kontakte")
+                                }
                             }
                         }
-                    }
-                    if (contacts.journalName != null) {
-                        val voltage = connection.batteryMv?.let { String.format(Locale.GERMANY, "%.3f V", it / 1000.0) } ?: "—"
-                        val noiseFloor = connection.noiseFloorDbm?.let { "$it dBm" } ?: "—"
-                        Text("Akku $voltage · Noise Floor $noiseFloor", style = MaterialTheme.typography.bodySmall)
-                    }
-                    scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .toggleable(keepScreenOn, role = Role.Checkbox, onValueChange = onKeepScreenOnChange)
-                            .padding(vertical = 12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(checked = keepScreenOn, onCheckedChange = null)
-                        Text("Display aktiv halten", style = MaterialTheme.typography.bodyMedium)
+                        if (contacts.journalName != null) {
+                            val voltage = connection.batteryMv?.let { String.format(Locale.GERMANY, "%.3f V", it / 1000.0) } ?: "—"
+                            val noiseFloor = connection.noiseFloorDbm?.let { "$it dBm" } ?: "—"
+                            Text("Akku $voltage · Noise Floor $noiseFloor", style = MaterialTheme.typography.bodySmall)
+                        }
+                        scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .toggleable(keepScreenOn, role = Role.Checkbox, onValueChange = onKeepScreenOnChange)
+                                .padding(vertical = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(checked = keepScreenOn, onCheckedChange = null)
+                            Text("Display aktiv halten", style = MaterialTheme.typography.bodyMedium)
+                        }
                     }
                 }
                 if (!editingMessage && !connection.active && companions.isNotEmpty()) {
@@ -188,18 +206,15 @@ internal fun MonitorScreen(
                     }
                 }
                 historyError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                if (!editingMessage) {
-                    SecondaryTabRow(selectedTabIndex = selectedTab) {
-                        Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Live-Funk") })
-                        Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("DISCOVER") })
-                        Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { UnreadLabel("Nachrichten", unreadHere.isNotEmpty()) })
-                    }
-                }
                 if (selectedTab == 0) {
-                    SecondaryTabRow(selectedTabIndex = liveTab) {
-                        Tab(selected = liveTab == 0, onClick = { liveTab = 0 }, text = { Text("Empfang") })
-                        Tab(selected = liveTab == 1, onClick = { liveTab = 1 }, text = { Text("Repeater") })
-                    }
+                    IconTabRow(
+                        liveTab, { liveTab = it },
+                        listOf(
+                            MonitorTab("Empfang", R.drawable.ic_tab_radio),
+                            MonitorTab("Repeater", R.drawable.ic_tab_repeater),
+                        ),
+                        Modifier.align(Alignment.CenterHorizontally),
+                    )
                     if (liveTab == 0) {
                         tabState.SaveableStateProvider("live-rx") {
                             LiveView(model, companion, contacts, liveState, Modifier.weight(1f))
@@ -209,10 +224,16 @@ internal fun MonitorScreen(
                             Modifier.weight(1f))
                     }
                 } else if (selectedTab == 2) {
-                    SecondaryTabRow(selectedTabIndex = messageTab) {
-                        Tab(selected = messageTab == 0, onClick = { messageTab = 0 }, text = { UnreadLabel("Kanäle", unreadHere.any { !it.startsWith(PRIVATE_ID_PREFIX) }) })
-                        Tab(selected = messageTab == 1, onClick = { messageTab = 1 }, text = { UnreadLabel("Privat", unreadHere.any { it.startsWith(PRIVATE_ID_PREFIX) }) })
-                    }
+                    IconTabRow(
+                        messageTab, { messageTab = it },
+                        listOf(
+                            MonitorTab("Kanäle", R.drawable.ic_tab_channels,
+                                unreadHere.any { !it.startsWith(PRIVATE_ID_PREFIX) }),
+                            MonitorTab("Privat", R.drawable.ic_tab_private,
+                                unreadHere.any { it.startsWith(PRIVATE_ID_PREFIX) }),
+                        ),
+                        Modifier.align(Alignment.CenterHorizontally),
+                    )
                     if (connection.syncingMessages) {
                         Text("Nachrichten werden abgeglichen …", style = MaterialTheme.typography.bodySmall)
                     }
@@ -223,7 +244,7 @@ internal fun MonitorScreen(
                         ChannelView(model, companion, connection.channelError.takeIf { messageTab == 0 },
                             Modifier.weight(1f), privateMessages = messageTab == 1, unread = unreadHere)
                     }
-                } else {
+                } else if (selectedTab == 1) {
                     DiscoverView(
                         discover, connection.discoverUnavailable, model::sendDiscover,
                         selectedTag = selectedDiscoverTag,
@@ -238,6 +259,44 @@ internal fun MonitorScreen(
                 canRefresh = contacts.canRefresh && !discover.busy && !connection.companionReadBusy,
             ),
                 model::refreshContacts) { showContacts = false }
+        }
+    }
+}
+
+private data class MonitorTab(
+    val label: String,
+    @param:DrawableRes val icon: Int,
+    val unread: Boolean = false,
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun IconTabRow(
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    tabs: List<MonitorTab>,
+    modifier: Modifier = Modifier,
+) {
+    SecondaryTabRow(
+        selectedTabIndex = selected,
+        modifier = modifier.widthIn(max = (tabs.size * 56).dp).fillMaxWidth(),
+    ) {
+        tabs.forEachIndexed { index, tab ->
+            TooltipBox(
+                positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+                tooltip = { PlainTooltip { Text(tab.label) } },
+                state = rememberTooltipState(),
+            ) {
+                Tab(
+                    selected = selected == index,
+                    onClick = { onSelect(index) },
+                    icon = {
+                        BadgedBox(badge = { if (tab.unread) UnreadDot() }) {
+                            Icon(painterResource(tab.icon), contentDescription = tab.label)
+                        }
+                    },
+                )
+            }
         }
     }
 }

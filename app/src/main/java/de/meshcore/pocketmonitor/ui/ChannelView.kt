@@ -203,7 +203,7 @@ internal fun ChannelView(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 if (item.identity in unread) UnreadDot()
-                                Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
+                                Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
                                     maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 when {
                                     privateMessages ->
@@ -218,7 +218,7 @@ internal fun ChannelView(
                                     ?: "Noch keine Nachrichten",
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodySmall,
+                                style = MaterialTheme.typography.bodyMedium,
                             )
                         }
                         HorizontalDivider()
@@ -494,9 +494,9 @@ internal fun ChannelConversation(
             val outgoingBubble = Modifier.fillMaxWidth(0.88f).background(colors.primaryContainer, shape)
             val bubble = Modifier.fillMaxWidth(0.88f).background(colors.surfaceVariant, shape)
             val bubblePadding = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-            val senderStyle = typography.titleSmall.copy(color = colors.onSurfaceVariant)
-            val timeStyle = typography.labelSmall.copy(color = colors.onSurfaceVariant)
-            val messageStyle = typography.bodyMedium.copy(color = colors.onSurfaceVariant)
+            val senderStyle = typography.titleMedium.copy(color = colors.onSurfaceVariant)
+            val timeStyle = typography.labelMedium.copy(color = colors.onSurfaceVariant)
+            val messageStyle = typography.bodyLarge.copy(color = colors.onSurfaceVariant)
             LazyColumn(
                 state = list,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
