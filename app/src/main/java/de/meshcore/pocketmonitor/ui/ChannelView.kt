@@ -339,10 +339,16 @@ private fun PagedConversation(
             }
         }
     }
+    val privateKey = channel.identity.removePrefix(PRIVATE_ID_PREFIX)
+    val eligible = privateSender?.takeIf { sender -> sender.contacts.any { it.publicKey == privateKey } }
+    val conversationHeader: (@Composable () -> Unit)? = if (privateMessages) {
+        { PrivatePathHeader(model, privateKey, eligible) }
+    } else null
     Column(modifier) {
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         ChannelConversation(channel.name, page?.rows.orEmpty(), onBack, Modifier.weight(1f), list,
             backLabel = if (privateMessages) "‹ Privat" else "‹ Kanäle",
+            header = conversationHeader,
             followLatest = before == null,
             onRead = if (before == null) null else { ids ->
                 try {
@@ -378,20 +384,18 @@ private fun PagedConversation(
             }
         }
         if (privateMessages) {
-            val key = channel.identity.removePrefix(PRIVATE_ID_PREFIX)
-            val eligible = privateSender?.takeIf { sender -> sender.contacts.any { it.publicKey == key } }
-            var retryOptions by remember(model, companion, key) {
-                mutableStateOf(model.privateRetryOptions(companion, key))
+            var retryOptions by remember(model, companion, privateKey) {
+                mutableStateOf(model.privateRetryOptions(companion, privateKey))
             }
             PrivateComposer(draft, { draft = it }, eligible, submitting, sendError, retryOptions, {
                 retryOptions = it
-                model.savePrivateRetryOptions(companion, key, it)
+                model.savePrivateRetryOptions(companion, privateKey, it)
             }) { text, options ->
                 val session = eligible?.session ?: return@PrivateComposer
                 if (submitting) return@PrivateComposer
                 submitting = true
                 sendError = null
-                model.sendPrivate(session, companion, key, text, options) { result ->
+                model.sendPrivate(session, companion, privateKey, text, options) { result ->
                     submitting = false
                     sendError = result
                     if (result == null && draft == text) {
@@ -434,6 +438,7 @@ internal fun ChannelConversation(
     onOutgoingDetails: ((Long) -> Unit)? = null,
     onReusePrivate: ((ChannelMessage) -> Unit)? = null,
     onReply: ((String) -> Unit)? = null,
+    header: (@Composable () -> Unit)? = null,
 ) {
     var displayed by remember { mutableStateOf(messages, referentialEqualityPolicy()) }
     var pendingLatest by remember { mutableStateOf<Long?>(null) }
@@ -484,6 +489,7 @@ internal fun ChannelConversation(
             Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+        header?.invoke()
         if (displayed.isEmpty()) {
             Text("Noch keine Nachrichten in dieser Unterhaltung.", Modifier.weight(1f))
         } else {
@@ -511,6 +517,9 @@ internal fun ChannelConversation(
                                 ListRowText(message.text, messageStyle.copy(color = colors.onPrimaryContainer))
                                 ListRowText(message.timestampLabel, timeStyle.copy(color = colors.onPrimaryContainer))
                                 ListRowText(privateStatus.label, timeStyle.copy(color = colors.onPrimaryContainer))
+                                message.privateProgressLabel?.let {
+                                    ListRowText(it, timeStyle.copy(color = colors.onPrimaryContainer))
+                                }
                                 if (onReusePrivate != null && privateStatus != PrivateSendStatus.WAITING &&
                                     privateStatus != PrivateSendStatus.ACCEPTED
                                 ) {

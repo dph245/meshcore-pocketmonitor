@@ -1,12 +1,9 @@
 package de.meshcore.pocketmonitor.ui
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -51,44 +48,15 @@ internal fun PrivateComposer(
             onClick = { onSend(draft, options) },
             enabled = sender != null && !sender.busy && !submitting && size != null && size <= limit,
         ) { Text("Senden") }
-        TextButton(onClick = { showOptions = true }) { Text("Sendeversuche") }
+        TextButton(onClick = { showOptions = true }) {
+            Text("Versand · ${if (options.manualRouting) "MANUELL" else "AUTO"}")
+        }
         if (sender?.busy == true) Text("Companion beschäftigt", style = MaterialTheme.typography.bodySmall)
     }
     if (showOptions) {
-        AlertDialog(
-            onDismissRequest = { showOptions = false },
-            title = { Text("Sendeversuche") },
-            text = {
-                Column {
-                    AttemptOptions("Über gelernten Pfad", options.pathAttempts) {
-                        changeOptions(options.copy(pathAttempts = it))
-                    }
-                    AttemptOptions("Über Flood", options.floodAttempts) {
-                        changeOptions(options.copy(floodAttempts = it))
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = options.resetPathForFlood,
-                            onCheckedChange = { changeOptions(options.copy(resetPathForFlood = it)) },
-                        )
-                        Text("Für Flood-Fallback Kontaktpfad löschen")
-                    }
-                    Text("Der Companion speichert die Pfadänderung. Ein neuer Pfad kann sich beim nächsten Funkkontakt ergeben.",
-                        style = MaterialTheme.typography.bodySmall)
-                }
-            },
-            confirmButton = { TextButton(onClick = { showOptions = false }) { Text("Fertig") } },
-        )
-    }
-}
-
-@Composable
-private fun AttemptOptions(label: String, selected: Int, select: (Int) -> Unit) {
-    Text(label)
-    Row {
-        for (count in 1..3) {
-            if (count == selected) Button(onClick = { select(count) }) { Text("$count") }
-            else TextButton(onClick = { select(count) }) { Text("$count") }
-        }
+        PrivateSendOptionsDialog(options, sender, onSave = {
+            changeOptions(it)
+            showOptions = false
+        }, onDismiss = { showOptions = false })
     }
 }

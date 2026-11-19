@@ -6,6 +6,7 @@ import android.os.Bundle
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateSendRoute
 import de.meshcore.pocketmonitor.protocol.HopResolver
 import de.meshcore.pocketmonitor.protocol.HopStatus
 import de.meshcore.pocketmonitor.rx.HistoryChannel
@@ -65,6 +66,7 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyPrivateContactFilter()
                 verifyGroupSend()
                 verifyPrivateSend()
+                verifyPrivateAttemptMigration()
             }
             result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private RX and TX, group send, repeats, migration and paging\n")
             Activity.RESULT_OK
@@ -292,11 +294,16 @@ class HistoryInstrumentation : Instrumentation() {
                 history.register(other, "Other", now)
                 val (accepted, time) = history.beginPrivate(id, contact, "Bestätigt", now)
                 check(history.unreadConversations().isEmpty())
-                check(history.messages(id, channel, null).rows.single().privateSend == PrivateSendStatus.WAITING)
+                check(history.messages(id, channel, null).rows.single().let {
+                    it.privateSend == PrivateSendStatus.WAITING && it.privateProgressLabel == "0 Versuche"
+                })
+                history.recordPrivateAttempt(accepted, 1, PrivateSendRoute.DIRECT)
+                check(history.messages(id, channel, null).rows.single().privateProgressLabel == "1 Versuch · zuletzt Direct")
+                history.recordPrivateAttempt(accepted, 2, PrivateSendRoute.FLOOD)
                 history.updatePrivate(accepted, PrivateSendStatus.ACKNOWLEDGED)
                 val (unfinished, nextTime) = history.beginPrivate(id, contact, "Unterbrochen", now)
                 check(nextTime == time + 1)
-                history.updatePrivate(unfinished, PrivateSendStatus.ACCEPTED)
+                history.recordPrivateAttempt(unfinished, 1, PrivateSendRoute.DIRECT)
                 check(history.channels(id, private = true).single().let { it.identity == channel && it.lastIncoming == null })
                 check(history.messages(other, channel, null).rows.isEmpty())
                 check(history.channels(id).isEmpty())
@@ -306,8 +313,36 @@ class HistoryInstrumentation : Instrumentation() {
                 val rows = history.messages(id, channel, null).rows
                 check(rows.map { it.text } == listOf("Bestätigt", "Unterbrochen"))
                 check(rows.map { it.privateSend } == listOf(PrivateSendStatus.ACKNOWLEDGED, PrivateSendStatus.UNKNOWN))
+                check(rows.map { it.privateProgressLabel } == listOf("2 Versuche · zuletzt Flood", "1 Versuch · zuletzt Direct"))
                 history.prune(now + HISTORY_AGE_MS + 1)
                 check(history.messages(id, channel, null).rows.isEmpty())
+            }
+        } finally {
+            targetContext.deleteDatabase(file)
+        }
+    }
+
+    private fun verifyPrivateAttemptMigration() {
+        val file = "private-progress-migration-${UUID.randomUUID()}.db"
+        val contact = CompanionContact("CC".repeat(32), "Ada", 1, 0, 0, "", 0, 0.0, 0.0, 0)
+        val channel = "pm:" + contact.publicKey
+        try {
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                history.register(id, "Companion", now)
+                val (message, _) = history.beginPrivate(id, contact, "Bestätigt", now)
+                history.updatePrivate(message, PrivateSendStatus.ACKNOWLEDGED)
+                val db = helper.writableDatabase
+                db.execSQL("ALTER TABLE private_send DROP COLUMN attempts")
+                db.execSQL("ALTER TABLE private_send DROP COLUMN last_route")
+                db.version = 7
+            }
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                check(history.messages(id, channel, null).rows.single().let {
+                    it.text == "Bestätigt" && it.privateSend == PrivateSendStatus.ACKNOWLEDGED &&
+                        it.privateProgressLabel == null
+                })
             }
         } finally {
             targetContext.deleteDatabase(file)

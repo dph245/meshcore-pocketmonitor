@@ -3,11 +3,16 @@ package de.meshcore.pocketmonitor.ui
 import android.app.Application
 import android.content.Context
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
+import de.meshcore.pocketmonitor.protocol.PrivateRoute
+import de.meshcore.pocketmonitor.protocol.CompanionManagement
+import de.meshcore.pocketmonitor.protocol.GroupSend
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
+import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.RadioChannel
+import de.meshcore.pocketmonitor.protocol.RepeaterSort
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.HistoryChannel
 import de.meshcore.pocketmonitor.rx.KnownCompanion
@@ -37,6 +42,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     private val scanner = CompanionScanner(application)
     private val history = CompanionHistory.get(application)
     private val preferences = application.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
+    private val livePreferences = application.getSharedPreferences("live_preferences", Context.MODE_PRIVATE)
     private val connection = CompanionConnection(application, history)
     private val mutableCompanions = MutableStateFlow<List<KnownCompanion>>(emptyList())
     val companions = mutableCompanions.asStateFlow()
@@ -52,7 +58,17 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val discover = connection.discover
     val groupSender = connection.groupSender
     val privateSender = connection.privateSender
+    val privatePath = connection.privatePath
     val liveRepeaters = connection.liveRepeaters
+
+    fun liveRepeaterSort(): RepeaterSort {
+        val saved = livePreferences.getString("repeater_sort", null)
+        return RepeaterSort.entries.firstOrNull { it.name == saved } ?: RepeaterSort.RECENT
+    }
+
+    fun saveLiveRepeaterSort(sort: RepeaterSort) {
+        livePreferences.edit { putString("repeater_sort", sort.name) }
+    }
 
     fun sendPrivate(session: String, companion: String, key: String, text: String,
                     options: PrivateRetryOptions, completed: (String?) -> Unit) {
@@ -156,9 +172,18 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun disconnect() = connection.disconnect()
 
+    fun watchPrivatePath(session: String, key: String, watching: Boolean) =
+        connection.watchPrivatePath(session, key, watching)
+
     fun refreshContacts() = connection.refreshContacts()
 
     fun sendDiscover() = connection.sendDiscover()
+
+    fun manageCompanion(session: String, action: CompanionAction, completed: (Result<String?>) -> Unit) {
+        connection.manage(session, action) { result ->
+            viewModelScope.launch { completed(result) }
+        }
+    }
 
     fun refreshChannels() = connection.refreshChannels()
 
@@ -186,12 +211,25 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     fun privateRetryOptions(companion: String, contact: String): PrivateRetryOptions {
         val key = privateRetryKey(companion, contact)
         val defaults = PrivateRetryOptions()
+        val route = PrivateRoute.create(
+            preferences.getInt("$key/route_width", 1),
+            preferences.getString("$key/route_hops", null)?.split(',').orEmpty(),
+        )
+        val savedScope = preferences.getString("$key/flood_scope", null)
+        val scope = when (savedScope) {
+            GroupSend.UNSCOPED -> savedScope
+            GroupSend.DEFAULT, null -> GroupSend.DEFAULT
+            else -> CompanionManagement.namedScope(savedScope) ?: GroupSend.DEFAULT
+        }
         return PrivateRetryOptions(
             pathAttempts = preferences.getInt("$key/path", defaults.pathAttempts)
-                .takeIf { it in 1..3 } ?: defaults.pathAttempts,
+                .takeIf { it in 1..PrivateRetryOptions.MAX_ATTEMPTS } ?: defaults.pathAttempts,
             floodAttempts = preferences.getInt("$key/flood", defaults.floodAttempts)
-                .takeIf { it in 1..3 } ?: defaults.floodAttempts,
+                .takeIf { it in 1..PrivateRetryOptions.MAX_ATTEMPTS } ?: defaults.floodAttempts,
             resetPathForFlood = preferences.getBoolean("$key/reset_path", defaults.resetPathForFlood),
+            floodScope = scope,
+            manualRouting = route != null && preferences.getBoolean("$key/manual", false),
+            manualRoute = route,
         )
     }
 
@@ -201,6 +239,10 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
             putInt("$key/path", options.pathAttempts)
             putInt("$key/flood", options.floodAttempts)
             putBoolean("$key/reset_path", options.resetPathForFlood)
+            putString("$key/flood_scope", options.floodScope)
+            putBoolean("$key/manual", options.manualRouting)
+            putInt("$key/route_width", options.manualRoute?.width ?: 1)
+            putString("$key/route_hops", options.manualRoute?.hops?.joinToString(","))
         }
     }
 

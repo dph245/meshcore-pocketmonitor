@@ -26,7 +26,7 @@ class ReceptionHistoryTest {
 
     @Test
     fun secretBearingRepliesStayOutsideTheJournal() {
-        for (code in listOf(0x0d, 0x0e, 0x12, 0x1c)) {
+        for (code in listOf(0x0d, 0x0e, 0x12, 0x1c, 0x1d)) {
             assertFalse(RxFrame(0, byteArrayOf(code.toByte())).isJournalable())
         }
         assertTrue(RxFrame(0, byteArrayOf(0x88.toByte(), 0x12, 0x1c)).isJournalable())

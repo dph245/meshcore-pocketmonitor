@@ -16,7 +16,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,7 +29,7 @@ import java.time.format.DateTimeFormatter
 @Composable
 internal fun LiveRepeaterView(model: MonitorViewModel, companion: String?, connected: Boolean, modifier: Modifier) {
     val snapshot by model.liveRepeaters.collectAsStateWithLifecycle()
-    var sort by rememberSaveable { mutableStateOf(RepeaterSort.RECENT) }
+    var sort by remember(model) { mutableStateOf(model.liveRepeaterSort()) }
     var expanded by remember { mutableStateOf(false) }
     val current = snapshot?.takeIf { connected && it.companion == companion }
     val rows = remember(current, sort) { current?.rows.orEmpty().sortedWith(sort.order.thenBy { it.id }) }
@@ -44,6 +43,7 @@ internal fun LiveRepeaterView(model: MonitorViewModel, companion: String?, conne
                     RepeaterSort.entries.forEach { option ->
                         DropdownMenuItem(text = { Text(option.label) }, onClick = {
                             sort = option
+                            model.saveLiveRepeaterSort(option)
                             expanded = false
                         })
                     }

@@ -94,7 +94,6 @@ internal fun MonitorScreen(
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var selectedDiscoverTag by rememberSaveable { mutableStateOf<Long?>(null) }
-    var showContacts by remember(contacts.journalName) { mutableStateOf(false) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var unread by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
     LaunchedEffect(model, lifecycle, historyReady) {
@@ -159,20 +158,16 @@ internal fun MonitorScreen(
                                 enabled = connection.active || (historyReady && scan.selected != null),
                             ) { Text(if (connection.active) "Trennen" else "Verbinden") }
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.weight(1f)) {
-                                DeviceMenu(scan, enabled = !connection.active, model = model)
-                            }
-                            if (contacts.journalName != null) {
-                                OutlinedButton(onClick = { showContacts = true }) {
-                                    Text(contacts.book?.let { "Kontakte (${it.list.contacts.size})" } ?: "Kontakte")
-                                }
-                            }
-                        }
+                        DeviceMenu(scan, enabled = !connection.active, model = model)
                         if (contacts.journalName != null) {
                             val voltage = connection.batteryMv?.let { String.format(Locale.GERMANY, "%.3f V", it / 1000.0) } ?: "—"
                             val noiseFloor = connection.noiseFloorDbm?.let { "$it dBm" } ?: "—"
                             Text("Akku $voltage · Noise Floor $noiseFloor", style = MaterialTheme.typography.bodySmall)
+                            val uptime = connection.uptimeSeconds?.let(::formatUptime) ?: "—"
+                            Text("Uptime $uptime", style = MaterialTheme.typography.bodySmall)
+                        }
+                        connection.management?.let { management ->
+                            CompanionControls(management, contacts, model)
                         }
                         scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         Row(
@@ -254,12 +249,6 @@ internal fun MonitorScreen(
                 }
             }
         }
-        if (showContacts) {
-            ContactOverview(contacts.copy(
-                canRefresh = contacts.canRefresh && !discover.busy && !connection.companionReadBusy,
-            ),
-                model::refreshContacts) { showContacts = false }
-        }
     }
 }
 
@@ -339,5 +328,16 @@ private fun DeviceMenu(scan: ScanState, enabled: Boolean, model: MonitorViewMode
                 onClick = { model.select(device); expanded = false },
             )
         }
+    }
+}
+
+internal fun formatUptime(seconds: Long): String {
+    val minutes = seconds / 60
+    val days = minutes / (24 * 60)
+    val hours = minutes / 60 % 24
+    return buildString {
+        if (days > 0) append("${days}d ")
+        if (days > 0 || hours > 0) append("${hours}h ")
+        append("${minutes % 60}min")
     }
 }

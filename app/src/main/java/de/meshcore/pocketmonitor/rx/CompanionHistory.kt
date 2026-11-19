@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
+import de.meshcore.pocketmonitor.protocol.PrivateSendRoute
 import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
@@ -13,6 +14,7 @@ import de.meshcore.pocketmonitor.protocol.CompanionContact
 import de.meshcore.pocketmonitor.protocol.MessageAddress
 import de.meshcore.pocketmonitor.protocol.QueuedMessage
 import de.meshcore.pocketmonitor.protocol.splitChannelText
+import de.meshcore.pocketmonitor.protocol.CompanionManagement
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.MeshPayload
 import de.meshcore.pocketmonitor.protocol.MeshHeader
@@ -142,7 +144,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 put("sent_at", now / 1000)
                 put("body", text)
             })
-            database.execSQL("INSERT INTO private_send VALUES (?, ?, ?)",
+            database.execSQL("INSERT INTO private_send (message_id, created_at, status, attempts) VALUES (?, ?, ?, 0)",
                 arrayOf<Any>(id, now, PrivateSendStatus.WAITING.name))
             database.execSQL("UPDATE companion SET group_wire_time = ? WHERE id = ?", arrayOf<Any>(wireTime, companion))
             id to wireTime
@@ -153,6 +155,12 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     fun updatePrivate(id: Long, status: PrivateSendStatus) {
         db.execSQL("UPDATE private_send SET status = ? WHERE message_id = ?", arrayOf<Any>(status.name, id))
+        changes.incrementAndGet()
+    }
+
+    fun recordPrivateAttempt(id: Long, attempts: Int, route: PrivateSendRoute) {
+        db.execSQL("UPDATE private_send SET status = ?, attempts = ?, last_route = ? WHERE message_id = ?",
+            arrayOf<Any>(PrivateSendStatus.ACCEPTED.name, attempts, route.name, id))
         changes.incrementAndGet()
     }
 
@@ -303,7 +311,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                 group_send.scope, group_send.status, group_send.channel_name, group_send.created_at,
                 CASE WHEN group_send.message_id IS NOT NULL THEN
                     (SELECT count(*) FROM group_repeat WHERE send_id = message.id)
-                END, private_send.status, message.unread
+                END, private_send.status, message.unread, private_send.attempts, private_send.last_route
             FROM message LEFT JOIN group_send ON group_send.message_id = message.id
                 LEFT JOIN private_send ON private_send.message_id = message.id
             WHERE message.companion = ? AND channel = ? $boundary
@@ -315,7 +323,8 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
                     getString(4), getLong(5), getLong(6) > 0,
                     if (isNull(7)) null else OutgoingGroup(getString(7), GroupSendStatus.valueOf(getString(8)),
                         getLong(11), getString(9), getLong(10)),
-                    getString(12)?.let(PrivateSendStatus::valueOf), getInt(13) != 0)
+                    getString(12)?.let(PrivateSendStatus::valueOf), getInt(13) != 0,
+                    if (isNull(14)) null else getInt(14), getString(15)?.let(PrivateSendRoute::valueOf))
             }
         }
         return HistoryPage(rows.take(limit).asReversed(), rows.size > limit, unreadThrough)
@@ -529,7 +538,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 }
 
 internal fun RxFrame.isJournalable(): Boolean = when (code) {
-    ChannelQuery.CHANNEL_INFO, ChannelQuery.DEFAULT_FLOOD_SCOPE,
+    ChannelQuery.CHANNEL_INFO, ChannelQuery.DEFAULT_FLOOD_SCOPE, CompanionManagement.CLI_REPLY,
     CompanionProtocol.PRIVATE_KEY_REPLY, CompanionProtocol.Command.DEVICE_QUERY.expectedReply -> false
     else -> true
 }

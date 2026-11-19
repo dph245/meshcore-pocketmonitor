@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import de.meshcore.pocketmonitor.protocol.CompanionContact
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 7) {
+    SQLiteOpenHelper(context, name, null, 8) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -62,6 +62,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         upgradeMessages(db)
         createGroupSendTables(db)
         createPrivateSendTable(db)
+        addPrivateSendProgress(db)
         addUnreadColumn(db)
         indexIncomingMessages(db)
         createContactTypes(db)
@@ -85,6 +86,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
                 SELECT companion, public_key, ${CompanionContact.TYPE_REPEATER} FROM group_repeater
             """)
         }
+        if (oldVersion < 8) addPrivateSendProgress(db)
     }
 
     private fun createContactTypes(db: SQLiteDatabase) {
@@ -124,6 +126,11 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
             )
         """)
         db.execSQL("CREATE INDEX private_send_expiry ON private_send(created_at)")
+    }
+
+    private fun addPrivateSendProgress(db: SQLiteDatabase) {
+        db.execSQL("ALTER TABLE private_send ADD COLUMN attempts INTEGER")
+        db.execSQL("ALTER TABLE private_send ADD COLUMN last_route TEXT")
     }
 
     private fun createGroupSendTables(db: SQLiteDatabase) {

@@ -1,5 +1,8 @@
 package de.meshcore.pocketmonitor.protocol
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
 internal enum class TelemetryMetric(
     val command: ByteArray,
     val responseCode: Int,
@@ -8,19 +11,24 @@ internal enum class TelemetryMetric(
 ) {
     BATTERY(byteArrayOf(0x14), 0x0c, null, 0),
     NOISE_FLOOR(byteArrayOf(0x38, 0x01), 0x18, 1, 8),
+    UPTIME(byteArrayOf(0x38, 0x00), 0x18, 0, 8),
 }
 
 internal class TelemetryQuery(val metric: TelemetryMetric) : CompanionRead(
     metric.command, metric.responseCode, metric.responseSubtype,
 ) {
-    fun value(frame: ByteArray): Int? {
+    fun value(frame: ByteArray): Long? {
         val offset = if (metric.responseSubtype == null) 1 else 2
         if (frame.size < offset + 2 || frame[0].toInt() != metric.responseCode) return null
         if (metric.responseSubtype != null && frame[1].toInt() != metric.responseSubtype) return null
         val raw = (frame[offset].toInt() and 0xff) or ((frame[offset + 1].toInt() and 0xff) shl 8)
         return when (metric) {
-            TelemetryMetric.BATTERY -> raw.takeUnless { it == 0 }
-            TelemetryMetric.NOISE_FLOOR -> raw.toShort().toInt().takeUnless { it == 0 }
+            TelemetryMetric.BATTERY -> raw.toLong().takeUnless { it == 0L }
+            TelemetryMetric.NOISE_FLOOR -> raw.toShort().toLong().takeUnless { it == 0L }
+            // Core stats carry battery millivolts before the unsigned uptime in seconds.
+            TelemetryMetric.UPTIME -> frame.takeIf { it.size >= 11 }?.let {
+                ByteBuffer.wrap(it, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+            }
         }
     }
 }

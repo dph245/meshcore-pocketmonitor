@@ -4,9 +4,11 @@ import de.meshcore.pocketmonitor.protocol.CompanionContact
 import de.meshcore.pocketmonitor.protocol.CompanionRead
 import de.meshcore.pocketmonitor.protocol.PrivateRetry
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
+import de.meshcore.pocketmonitor.protocol.PrivateRoute
 import de.meshcore.pocketmonitor.protocol.PrivateSend
 import de.meshcore.pocketmonitor.protocol.PrivateSendReceipt
 import de.meshcore.pocketmonitor.protocol.PrivateSendStep
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -67,6 +69,66 @@ class PrivateSendTest {
         }
         assertEquals(PrivateSendStep.DONE, tx.next())
         assertFalse(tx.acknowledged)
+    }
+
+    @Test fun `four retries after the first attempt in each phase`() {
+        val tx = PrivateRetry(PrivateRetryOptions(pathAttempts = 5, floodAttempts = 5, resetPathForFlood = true))
+        repeat(5) { attempt ->
+            assertEquals(PrivateSendStep.SEND, tx.next())
+            assertEquals(attempt, tx.attempt)
+            tx.receipt(PrivateSendReceipt(false, 1L + attempt, 500))
+        }
+        assertEquals(PrivateSendStep.RESET_PATH, tx.next())
+        assertFalse(tx.floodPhase)
+        tx.pathReset()
+        repeat(5) { attempt ->
+            assertTrue(tx.floodPhase)
+            assertEquals(PrivateSendStep.SEND, tx.next())
+            assertEquals(5 + attempt, tx.attempt)
+            tx.receipt(PrivateSendReceipt(true, 6L + attempt, 500))
+        }
+        assertEquals(PrivateSendStep.DONE, tx.next())
+    }
+
+    @Test fun `manual path encodes hash width and preserves other contact fields`() {
+        val original = ByteArray(148) { it.toByte() }.apply {
+            this[0] = 3
+            key.hexToByteArray().copyInto(this, 1)
+        }
+        val route = checkNotNull(PrivateRoute.create(2, listOf(" 123a ", "b456")))
+        val set = PrivateSend.setPath(original, route)
+        assertEquals(9, set[0].toInt())
+        assertArrayEquals(original.copyOfRange(1, 35), set.copyOfRange(1, 35))
+        assertEquals(0x42, set[35].toInt())
+        assertEquals("123ab456", set.copyOfRange(36, 40).toHexString())
+        assertArrayEquals(ByteArray(60), set.copyOfRange(40, 100))
+        assertArrayEquals(original.copyOfRange(100, 148), set.copyOfRange(100, 148))
+
+        val verified = checkNotNull(CompanionContact.decode(set.copyOf().apply { this[0] = 3 }))
+        assertEquals(route.signature, PrivateSend.pathSignature(verified))
+        assertNull(PrivateSend.pathSignature(verified.copy(outPathLength = 255)))
+        assertArrayEquals(byteArrayOf(0x1e) + key.hexToByteArray(), PrivateSend.readContact(key))
+        assertNull(PrivateRoute.create(2, listOf("ab", "1234")))
+        assertNull(PrivateRoute.create(3, List(22) { "ab1234" }))
+        assertEquals(21, PrivateRoute.maxHops(3))
+    }
+
+    @Test fun `path update identifies the contact and its outgoing record supplies the hops`() {
+        val update = byteArrayOf(0x81.toByte()) + key.hexToByteArray()
+        assertEquals(key, PrivateSend.pathUpdatedKey(update))
+        assertNull(PrivateSend.pathUpdatedKey(update.copyOf(32)))
+        assertNull(PrivateSend.pathUpdatedKey(update.apply { this[0] = 0x82.toByte() }))
+
+        val path = checkNotNull(PrivateSend.outgoingPath(contact.copy(
+            outPathLength = 0x82, outPathHex = "a1b2c3d4e5f6" + "00".repeat(58),
+        )))
+        assertEquals(3, path.prefixSize)
+        assertEquals(listOf("A1B2C3", "D4E5F6"), path.prefixes)
+        assertTrue(checkNotNull(PrivateSend.outgoingPath(contact)).prefixes.isEmpty())
+        assertNull(PrivateSend.outgoingPath(contact.copy(outPathLength = 0xff)))
+        assertNull(PrivateSend.outgoingPath(contact.copy(outPathLength = 0xc0)))
+        assertNull(PrivateSend.outgoingPath(contact.copy(outPathLength = 0x96)))
+        assertNull(PrivateSend.outgoingPath(contact.copy(outPathLength = 2, outPathHex = "AA")))
     }
 
     @Test fun `unrelated tokens do not stop retries and a late token from an earlier try does`() {
