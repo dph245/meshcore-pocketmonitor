@@ -3,6 +3,7 @@ package de.meshcore.pocketmonitor.ui
 import android.app.Application
 import android.content.Context
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
+import de.meshcore.pocketmonitor.protocol.TracePath
 import de.meshcore.pocketmonitor.protocol.PrivateRoute
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 import de.meshcore.pocketmonitor.protocol.GroupSend
@@ -57,6 +58,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val scan = mutableScan.asStateFlow()
     val connectionStatus = connection.status
     val discover = connection.discover
+    val traces = connection.traces
     val groupSender = connection.groupSender
     val privateSender = connection.privateSender
     val privatePath = connection.privatePath
@@ -196,6 +198,9 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     fun refreshContacts() = connection.refreshContacts()
 
     fun sendDiscover() = connection.sendDiscover()
+
+    fun sendTrace(session: String, path: TracePath) =
+        connection.sendTrace(session, path)
 
     fun cliTerminal(session: String): CliTerminalState =
         terminal?.takeIf { it.session == session } ?: CliTerminalState(session).also { terminal = it }

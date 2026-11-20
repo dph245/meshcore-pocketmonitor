@@ -82,6 +82,7 @@ internal fun MonitorScreen(
     val scan by model.scan.collectAsStateWithLifecycle()
     val connection by model.connectionStatus.collectAsStateWithLifecycle()
     val discover by model.discover.collectAsStateWithLifecycle()
+    val traces by model.traces.collectAsStateWithLifecycle()
     val contacts = connection.contacts
     val companions by model.companions.collectAsStateWithLifecycle()
     val companion by model.selectedCompanion.collectAsStateWithLifecycle()
@@ -93,6 +94,7 @@ internal fun MonitorScreen(
     var selectedTab by rememberSaveable { mutableIntStateOf(3) }
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
+    var discoverTab by rememberSaveable { mutableIntStateOf(0) }
     var selectedDiscoverTag by rememberSaveable { mutableStateOf<Long?>(null) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var unread by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
@@ -241,12 +243,23 @@ internal fun MonitorScreen(
                             channelManagement = connection.channelManagement)
                     }
                 } else if (selectedTab == 1) {
-                    DiscoverView(
-                        discover, connection.discoverUnavailable, model::sendDiscover,
-                        selectedTag = selectedDiscoverTag,
-                        onSelect = { selectedDiscoverTag = it },
-                        modifier = Modifier.weight(1f),
-                    )
+                    SecondaryTabRow(selectedTabIndex = discoverTab) {
+                        listOf("DISCOVER", "TRACE").forEachIndexed { index, label ->
+                            Tab(selected = discoverTab == index, onClick = { discoverTab = index }, text = { Text(label) })
+                        }
+                    }
+                    if (discoverTab == 0) {
+                        DiscoverView(
+                            discover, connection.discoverUnavailable, model::sendDiscover,
+                            selectedTag = selectedDiscoverTag,
+                            onSelect = { selectedDiscoverTag = it },
+                            modifier = Modifier.weight(1f),
+                        )
+                    } else {
+                        tabState.SaveableStateProvider("trace") {
+                            TraceView(traces, connection.traceSender, contacts.book, model::sendTrace, Modifier.weight(1f))
+                        }
+                    }
                 }
             }
         }

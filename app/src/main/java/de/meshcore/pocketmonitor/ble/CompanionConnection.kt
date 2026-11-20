@@ -52,12 +52,18 @@ import de.meshcore.pocketmonitor.protocol.QueuedMessage
 import de.meshcore.pocketmonitor.protocol.ChannelSlot
 import de.meshcore.pocketmonitor.protocol.TelemetryMetric
 import de.meshcore.pocketmonitor.protocol.TelemetryQuery
+import de.meshcore.pocketmonitor.protocol.TraceCommand
+import de.meshcore.pocketmonitor.protocol.TracePath
+import de.meshcore.pocketmonitor.protocol.TracePhase
+import de.meshcore.pocketmonitor.protocol.TraceResponse
+import de.meshcore.pocketmonitor.protocol.TraceRun
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.KnownCompanion
 import de.meshcore.pocketmonitor.rx.HistoryChannel
 import de.meshcore.pocketmonitor.rx.ReceptionWriter
 import java.util.UUID
+import kotlin.random.Random
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -76,7 +82,10 @@ internal data class ConnectionStatus(
     val noiseFloorDbm: Int? = null,
     val uptimeSeconds: Long? = null,
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
+    val traceSender: TraceSender? = null,
 )
+
+internal data class TraceSender(val session: String, val mtu: Int, val unavailable: String?)
 
 internal data class ChannelManagementStatus(
     val session: String,
@@ -202,6 +211,8 @@ internal class CompanionConnection(private val context: Context, private val his
     val liveRepeaters = mutableLiveRepeaters.asStateFlow()
     private val searches = DiscoverSearches()
     val discover = searches.history
+    private val mutableTraces = MutableStateFlow<List<TraceRun>>(emptyList())
+    val traces = mutableTraces.asStateFlow()
 
     private val mutableCompanion = MutableStateFlow<KnownCompanion?>(null)
     val companion = mutableCompanion.asStateFlow()
@@ -253,6 +264,10 @@ internal class CompanionConnection(private val context: Context, private val his
 
     fun refreshChannels() {
         handler.post { current?.refreshChannels() }
+    }
+
+    fun sendTrace(session: String, path: TracePath) {
+        handler.post { current?.sendTrace(session, path) }
     }
 
     fun sendDiscover() {
@@ -341,6 +356,8 @@ internal class CompanionConnection(private val context: Context, private val his
         private val unavailableMetrics = mutableSetOf<TelemetryMetric>()
         private val pollTelemetry = Runnable { pollTelemetryWhenIdle() }
         private var discoverReply: DiscoverCommandReply? = null
+        private var traceCommand: TraceCommand? = null
+        private var traceTimer: Runnable? = null
         private var discoverDisabled: String? = null
         private var commandChannelUncertain = false
         private var timeout: Runnable? = null
@@ -480,6 +497,15 @@ internal class CompanionConnection(private val context: Context, private val his
                 }
                 return@guarded
             }
+            traceCommand?.let { command ->
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    command.acknowledgeWrite()
+                    traceProgress(command)
+                } else {
+                    finishTraceCommand("BLE-Schreibbestätigung fehlgeschlagen (GATT $status).", uncertain = true)
+                }
+                return@guarded
+            }
             discoverReply?.let { reply ->
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     reply.acknowledgeWrite()
@@ -554,6 +580,10 @@ internal class CompanionConnection(private val context: Context, private val his
                         }
                     }
                 }
+                if (frame.code == TraceResponse.CODE) {
+                    receiveTrace(frame.bytes)
+                    return@guarded
+                }
                 searches.receive(discoverSession, frame, elapsedMs)
                 PrivateSend.changedContact(frame.bytes)?.let { invalidatePrivateContact(it, frame.code) }
                 val updatedPath = PrivateSend.pathUpdatedKey(frame.bytes)
@@ -602,6 +632,11 @@ internal class CompanionConnection(private val context: Context, private val his
                 telemetryQuery?.let { query ->
                     query.receive(frame.bytes)
                     telemetryProgress(gatt, query)
+                    return@guarded
+                }
+                traceCommand?.let { command ->
+                    command.receive(frame.bytes)
+                    traceProgress(command)
                     return@guarded
                 }
                 discoverReply?.let { reply ->
@@ -660,6 +695,7 @@ internal class CompanionConnection(private val context: Context, private val his
                             error = if (canLoad) null else "Kontaktliste benötigt BLE-MTU ≥ 151 (aktuell $mtu).",
                         ),
                         discoverUnavailable = discoverUnavailable(),
+                        traceSender = traceSender(),
                     )
                     refreshContacts()
                     startInitialMetadata()
@@ -671,8 +707,8 @@ internal class CompanionConnection(private val context: Context, private val his
             val contacts = mutableStatus.value.contacts
             val connection = gatt ?: return@guarded
             if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null || messageSync != null ||
-                searches.history.value.busy || group != null || privateCommand != null || management != null ||
-                privatePathQuery != null || commandChannelUncertain) {
+                searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
+                management != null || privatePathQuery != null || commandChannelUncertain) {
                 return@guarded
             }
             startContactTransfer(connection)
@@ -849,8 +885,8 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return
             if (initialTelemetryPending || !messagesWaiting || messageSync != null || !mutableStatus.value.active || initialMetadataPending ||
                 channelQuery != null || contactTransfer != null || telemetryQuery != null ||
-                searches.history.value.busy || group != null || privateCommand != null || management != null ||
-                privatePathQuery != null || commandChannelUncertain
+                searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
+                management != null || privatePathQuery != null || commandChannelUncertain
             ) return
             if (mtu < CompanionProtocol.FULL_FRAME_MTU) {
                 messagesWaiting = false
@@ -928,8 +964,8 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = gatt ?: return@guarded
             if (commandChannelUncertain) return@guarded
             if (contactTransfer != null || channelQuery != null || messageSync != null || telemetryQuery != null ||
-                searches.history.value.busy || group != null || privateCommand != null || management != null ||
-                privatePathQuery != null
+                searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
+                management != null || privatePathQuery != null
             ) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
@@ -1024,6 +1060,7 @@ internal class CompanionConnection(private val context: Context, private val his
                     )
                 } else null,
                 discoverUnavailable = discoverUnavailable(),
+                traceSender = traceSender(),
             )
             mutablePrivateSender.value = if (id != null && mutableStatus.value.active &&
                 !commandChannelUncertain && sendableContacts.isNotEmpty()
@@ -1066,7 +1103,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private fun commandBusy(): Boolean = pending != null || initialMetadataPending || initialTelemetryPending ||
             group != null || privateCommand != null || contactTransfer != null || channelQuery != null ||
             telemetryQuery != null || messageSync != null || searches.history.value.busy || management != null ||
-            privatePathQuery != null
+            privatePathQuery != null || traceCommand != null
 
         fun watchPrivatePath(session: String, key: String, watching: Boolean) {
             if (session != discoverSession || (!watching && key != watchedPrivateKey)) return
@@ -1906,12 +1943,124 @@ internal class CompanionConnection(private val context: Context, private val his
             }
         }
 
+        private fun traceSender() = TraceSender(discoverSession, mtu, when {
+            commandChannelUncertain -> "Companion-Befehlsstatus unklar. Erneut verbinden."
+            mtu < 18 -> "BLE-MTU für TRACE zu klein."
+            commandBusy() || privateTx != null -> "Bitte den laufenden Companion-Vorgang abwarten."
+            else -> null
+        })
+
+        private fun activeTrace(): TraceRun? =
+            mutableTraces.value.lastOrNull()?.takeIf { it.session == discoverSession && it.busy }
+
+        private fun updateTrace(run: TraceRun) {
+            mutableTraces.value = mutableTraces.value.map {
+                if (it.tag == run.tag && it.session == run.session) run else it
+            }
+        }
+
+        fun sendTrace(session: String, path: TracePath) = guarded {
+            val connection = gatt ?: return@guarded
+            val identity = journalName ?: return@guarded
+            if (!mutableStatus.value.active || session != discoverSession || traceSender().unavailable != null ||
+                activeTrace() != null || path.hashes.size > TracePath.maxHops(path.hashBytes, mtu)
+            ) return@guarded
+
+            val runs = mutableTraces.value
+            var tag = Random.nextInt().toUInt()
+            while (runs.any { it.tag == tag }) tag = Random.nextInt().toUInt()
+            val auth = Random.nextInt().toUInt()
+            val run = TraceRun(
+                discoverSession, tag, auth, path, System.currentTimeMillis(),
+                mutableStatus.value.contacts.resolverFor(identity),
+            )
+            val command = TraceCommand(path, tag, auth)
+            traceCommand = command
+            mutableTraces.value = (runs + run).takeLast(20)
+            publishCommandState()
+            timeout = Runnable {
+                finishTraceCommand("Zeitüberschreitung bei der Companion-Bestätigung. Sendestatus unklar.", uncertain = true)
+            }.also { handler.postDelayed(it, DiscoverSearches.REPLY_TIMEOUT_MS) }
+            if (!write(connection, command.command)) {
+                finishTraceCommand("BLE-Schreibvorgang konnte nicht gestartet werden.")
+            }
+        }
+
+        private fun traceProgress(command: TraceCommand) {
+            val frame = command.result ?: return
+            val run = activeTrace() ?: return
+            val estimate = TraceCommand.estimateMs(frame)
+            if (estimate == null) {
+                val error = frame.getOrNull(1)?.toInt()?.and(0xff)
+                when {
+                    frame[0].toInt() == CompanionProtocol.ERROR && frame.size == 2 ->
+                        finishTraceCommand("Companion hat TRACE abgelehnt (Code $error).")
+                    frame[0].toInt() == CompanionProtocol.DISABLED && frame.size == 1 ->
+                        finishTraceCommand("TRACE ist auf dem Companion deaktiviert.")
+                    else -> finishTraceCommand("Ungültige TRACE-Sendebestätigung.", uncertain = true)
+                }
+                return
+            }
+
+            clearTimeout()
+            traceCommand = null
+            if (run.response != null) {
+                updateTrace(run.copy(phase = TracePhase.ANSWERED))
+            } else {
+                updateTrace(run.copy(phase = TracePhase.LISTENING))
+                traceTimer = Runnable {
+                    traceTimer = null
+                    activeTrace()?.takeIf { it.tag == run.tag }?.let {
+                        updateTrace(it.copy(phase = TracePhase.TIMED_OUT))
+                    }
+                }.also { handler.postDelayed(it, (estimate + 2_000).coerceIn(5_000, 10 * 60_000)) }
+            }
+            publishCommandState()
+            handler.post(resumeMessageSync)
+        }
+
+        private fun finishTraceCommand(message: String, uncertain: Boolean = false) {
+            clearTimeout()
+            traceCommand = null
+            activeTrace()?.let { run ->
+                updateTrace(run.copy(
+                    phase = if (run.response == null) TracePhase.FAILED else TracePhase.ANSWERED,
+                    message = message,
+                ))
+            }
+            if (uncertain) commandChannelUncertain = true
+            val contacts = mutableStatus.value.contacts
+            publishCommandState(if (uncertain) contacts.copy(
+                canRefresh = false, error = "Companion-Befehlsstatus unklar. Erneut verbinden.",
+            ) else contacts)
+            handler.post(resumeMessageSync)
+        }
+
+        private fun receiveTrace(frame: ByteArray) {
+            val response = TraceResponse.decode(frame) ?: return
+            val run = mutableTraces.value.lastOrNull {
+                it.session == discoverSession && it.tag == response.tag
+            } ?: return
+            if (run.response != null || !run.matches(response)) return
+            when (run.phase) {
+                TracePhase.CONFIRMING -> updateTrace(run.copy(response = response))
+                TracePhase.LISTENING -> {
+                    traceTimer?.let(handler::removeCallbacks)
+                    traceTimer = null
+                    updateTrace(run.copy(phase = TracePhase.ANSWERED, response = response))
+                }
+                TracePhase.TIMED_OUT -> updateTrace(run.copy(phase = TracePhase.ANSWERED, response = response, late = true))
+                else -> Unit
+            }
+        }
+
         private fun discoverUnavailable(): String? = when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
             management != null -> "Ein Companion-Befehl läuft …"
             group != null -> "Kanalnachricht wird gesendet …"
             privateCommand != null -> "Private Nachricht wird an den Companion übergeben …"
             privatePathQuery != null -> "Warte auf den Kontaktpfad …"
+            traceCommand != null -> "Warte auf die TRACE-Sendebestätigung …"
             discoverDisabled != null -> discoverDisabled
             firmwareVersion == null -> "Companion-Protokollversion für DISCOVER fehlt."
             (firmwareVersion ?: 0) < CompanionProtocol.DISCOVER_MIN_VERSION ->
@@ -2067,6 +2216,13 @@ internal class CompanionConnection(private val context: Context, private val his
             handler.removeCallbacks(resumeMessageSync)
             clearTimeout()
             searches.disconnect(discoverSession, message)
+            traceTimer?.let(handler::removeCallbacks)
+            activeTrace()?.let { run ->
+                updateTrace(run.copy(
+                    phase = if (run.response == null) TracePhase.DISCONNECTED else TracePhase.ANSWERED,
+                    message = message,
+                ))
+            }
             writer.close()
             previousWriter = writer.completion
             channelCatalog = null
