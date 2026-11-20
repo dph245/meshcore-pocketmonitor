@@ -44,6 +44,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     private val preferences = application.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
     private val livePreferences = application.getSharedPreferences("live_preferences", Context.MODE_PRIVATE)
     private val connection = CompanionConnection(application, history)
+    private var terminal: CliTerminalState? = null
     private val mutableCompanions = MutableStateFlow<List<KnownCompanion>>(emptyList())
     val companions = mutableCompanions.asStateFlow()
     private val mutableSelectedCompanion = MutableStateFlow<String?>(null)
@@ -60,6 +61,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val privateSender = connection.privateSender
     val privatePath = connection.privatePath
     val liveRepeaters = connection.liveRepeaters
+    private val mutablePrivateOptionsRevision = MutableStateFlow(0L)
+    val privateOptionsRevision = mutablePrivateOptionsRevision.asStateFlow()
 
     fun liveRepeaterSort(): RepeaterSort {
         val saved = livePreferences.getString("repeater_sort", null)
@@ -77,6 +80,16 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
+    fun resetPrivatePath(session: String, companion: String, key: String, completed: (String?) -> Unit) {
+        manageCompanion(session, CompanionAction.ResetPrivatePath(key)) { result ->
+            if (result.isSuccess) {
+                val saved = privateRetryOptions(companion, key)
+                savePrivateRetryOptions(companion, key, saved.copy(manualRouting = false))
+            }
+            completed(result.exceptionOrNull()?.message)
+        }
+    }
+
     fun groupScope(companion: String, channel: String) = history.groupScope(companion, channel)
 
     fun groupRepeats(id: Long) = history.groupRepeats(id)
@@ -91,6 +104,11 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     }
 
     init {
+        viewModelScope.launch {
+            connectionStatus.collect { status ->
+                if (terminal?.session != status.management?.session) terminal = null
+            }
+        }
         viewModelScope.launch {
             connection.companion.collect { companion ->
                 if (companion != null) {
@@ -179,6 +197,9 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun sendDiscover() = connection.sendDiscover()
 
+    fun cliTerminal(session: String): CliTerminalState =
+        terminal?.takeIf { it.session == session } ?: CliTerminalState(session).also { terminal = it }
+
     fun manageCompanion(session: String, action: CompanionAction, completed: (Result<String?>) -> Unit) {
         connection.manage(session, action) { result ->
             viewModelScope.launch { completed(result) }
@@ -244,6 +265,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
             putInt("$key/route_width", options.manualRoute?.width ?: 1)
             putString("$key/route_hops", options.manualRoute?.hops?.joinToString(","))
         }
+        mutablePrivateOptionsRevision.value++
     }
 
     private fun privateRetryKey(companion: String, contact: String): String =

@@ -1,7 +1,8 @@
 package de.meshcore.pocketmonitor.ui
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -20,10 +21,12 @@ import de.meshcore.pocketmonitor.ble.PrivateSender
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun PrivateComposer(
     draft: String, changeDraft: (String) -> Unit, sender: PrivateSender?, submitting: Boolean, error: String?,
     options: PrivateRetryOptions, changeOptions: (PrivateRetryOptions) -> Unit,
+    onResetPath: () -> Unit,
     onSend: (String, PrivateRetryOptions) -> Unit,
 ) {
     var showOptions by remember { mutableStateOf(false) }
@@ -43,13 +46,21 @@ internal fun PrivateComposer(
         Text("Senden benötigt einen verbundenen Companion mit eindeutigem Kontakt.",
             style = MaterialTheme.typography.bodySmall)
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        itemVerticalAlignment = Alignment.CenterVertically,
+    ) {
         Button(
             onClick = { onSend(draft, options) },
             enabled = sender != null && !sender.busy && !submitting && size != null && size <= limit,
         ) { Text("Senden") }
-        TextButton(onClick = { showOptions = true }) {
-            Text("Versand · ${if (options.manualRouting) "MANUELL" else "AUTO"}")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { showOptions = true }, enabled = !submitting) {
+                Text("Versand · ${if (options.manualRouting) "MANUELL" else "AUTO"}")
+            }
+            TextButton(onClick = onResetPath, enabled = sender != null && !sender.busy && !submitting) {
+                Text("Pfad zurücksetzen")
+            }
         }
         if (sender?.busy == true) Text("Companion beschäftigt", style = MaterialTheme.typography.bodySmall)
     }

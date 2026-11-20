@@ -47,6 +47,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import de.meshcore.pocketmonitor.ble.PrivateSender
+import de.meshcore.pocketmonitor.ble.ChannelManagementStatus
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import androidx.lifecycle.repeatOnLifecycle
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
@@ -73,6 +74,7 @@ internal fun ChannelView(
     modifier: Modifier = Modifier,
     privateMessages: Boolean = false,
     unread: Set<String> = emptySet(),
+    channelManagement: ChannelManagementStatus? = null,
 ) {
     var order by remember(model, privateMessages) { mutableStateOf(model.conversationOrder(privateMessages)) }
     var selectedIdentity by rememberSaveable(companion) { mutableStateOf<String?>(null) }
@@ -140,11 +142,23 @@ internal fun ChannelView(
         }
     }
     val closeConversation = { selectedIdentity = null }
+    var managementSession by remember(companion) { mutableStateOf<String?>(null) }
+    val liveManagement = channelManagement?.takeIf { it.companion == companion && !privateMessages }
+    managementSession?.let { session ->
+        ChannelManagementDialog(
+            status = liveManagement?.takeIf { it.session == session },
+            submit = { action, completed -> model.manageCompanion(session, action, completed) },
+            onDismiss = { managementSession = null },
+        )
+    }
     LaunchedEffect(previews, channel) {
         if (!privateMessages && previews != null && channel == null) closeConversation()
     }
     BackHandler(enabled = channel != null, onBack = closeConversation)
     Column(modifier) {
+        if (channel == null && liveManagement != null) {
+            TextButton(onClick = { managementSession = liveManagement.session }) { Text("Kanäle verwalten") }
+        }
         (error ?: connectionError)?.let {
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
@@ -384,12 +398,22 @@ private fun PagedConversation(
             }
         }
         if (privateMessages) {
-            var retryOptions by remember(model, companion, privateKey) {
-                mutableStateOf(model.privateRetryOptions(companion, privateKey))
+            val optionsRevision by model.privateOptionsRevision.collectAsStateWithLifecycle()
+            val retryOptions = remember(model, companion, privateKey, optionsRevision) {
+                model.privateRetryOptions(companion, privateKey)
             }
             PrivateComposer(draft, { draft = it }, eligible, submitting, sendError, retryOptions, {
-                retryOptions = it
                 model.savePrivateRetryOptions(companion, privateKey, it)
+            }, onResetPath = {
+                val session = eligible?.session
+                if (session != null && !submitting) {
+                    submitting = true
+                    sendError = null
+                    model.resetPrivatePath(session, companion, privateKey) { result ->
+                        submitting = false
+                        sendError = result
+                    }
+                }
             }) { text, options ->
                 val session = eligible?.session ?: return@PrivateComposer
                 if (submitting) return@PrivateComposer

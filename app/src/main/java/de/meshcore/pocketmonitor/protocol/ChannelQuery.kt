@@ -27,6 +27,10 @@ internal class ChannelQuery(private val slot: Int? = null) : CompanionRead(
         const val CHANNEL_MTU = 53
         const val SCOPE_MTU = 51
 
+        fun emptySlot(frame: ByteArray): Boolean =
+            frame.size == CHANNEL_FRAME_SIZE && frame[0] == CHANNEL_INFO.toByte() &&
+                frame[2] == 0.toByte() && (34 until 50).all { frame[it] == 0.toByte() }
+
         fun configuredSlot(frame: ByteArray): ChannelSlot? {
             if (frame.size != CHANNEL_FRAME_SIZE || frame[0] != CHANNEL_INFO.toByte()) return null
             val name = frame.name(2, 34)?.takeIf { it.isNotEmpty() } ?: return null

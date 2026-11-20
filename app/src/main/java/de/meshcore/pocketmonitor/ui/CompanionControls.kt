@@ -5,9 +5,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -20,25 +17,32 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import de.meshcore.pocketmonitor.ble.ContactStatus
 import de.meshcore.pocketmonitor.ble.ManagementStatus
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 
-private enum class CompanionPanel { SCOPE, CONTACTS, CLI }
+private enum class CompanionPanel { SCOPE, CONTACTS, CLI, POSITION, LOCATION_SETTINGS }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus, model: MonitorViewModel) {
     var panel by remember(status.session) { mutableStateOf<CompanionPanel?>(null) }
-    var command by remember(status.session) { mutableStateOf("") }
-    var reply by remember(status.session) { mutableStateOf<String?>(null) }
-    var cliError by remember(status.session) { mutableStateOf<String?>(null) }
-    var waitingForCli by remember(status.session) { mutableStateOf(false) }
+    var advertPending by remember(status.session) { mutableStateOf(false) }
+    var feedback by remember(status.session) { mutableStateOf<Result<String>?>(null) }
     val ready = status.available && !status.busy
+
+    fun sendAdvert(flood: Boolean) {
+        if (!ready || advertPending) return
+        val name = if (flood) "Flood-Advert" else "Zero-Hop-Advert"
+        advertPending = true
+        feedback = null
+        model.manageCompanion(status.session, CompanionAction.SendAdvert(flood)) { result ->
+            advertPending = false
+            feedback = result.map { "$name vom Companion angenommen." }
+        }
+    }
 
     Text("Standard-Scope · ${status.scopeName?.ifEmpty { "Ohne Scope" } ?: "Nicht verfügbar"}",
         style = MaterialTheme.typography.bodyMedium)
@@ -51,6 +55,25 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
         }
         OutlinedButton(onClick = { panel = CompanionPanel.CLI }) { Text("Companion-CLI") }
     }
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = { sendAdvert(false) }, enabled = ready && !advertPending) {
+            Text("Advert Zero Hop")
+        }
+        OutlinedButton(onClick = { sendAdvert(true) }, enabled = ready && !advertPending) {
+            Text("Advert Flood")
+        }
+        OutlinedButton(onClick = { panel = CompanionPanel.POSITION }, enabled = status.available) {
+            Text("GPS-Position")
+        }
+        OutlinedButton(onClick = { panel = CompanionPanel.LOCATION_SETTINGS }, enabled = ready) {
+            Text("Standortfreigabe und GPS")
+        }
+    }
+    if (advertPending) Text("Warte auf die Bestätigung des Companion …", style = MaterialTheme.typography.bodySmall)
+    feedback?.fold(
+        onSuccess = { Text(it, style = MaterialTheme.typography.bodySmall) },
+        onFailure = { Text(it.message ?: "Advert fehlgeschlagen.", color = MaterialTheme.colorScheme.error) },
+    )
     if (!status.available) {
         Text("Companion erneut verbinden, um Befehle auszuführen.", color = MaterialTheme.colorScheme.error)
     }
@@ -69,58 +92,30 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
             onChange = { action, completed -> model.manageCompanion(status.session, action, completed) },
             onDismiss = { panel = null },
         )
-        CompanionPanel.CLI -> {
-            val focusManager = LocalFocusManager.current
-            val limit = status.cliTextLimit
-            val canSend = ready && !waitingForCli && limit != null &&
-                CompanionManagement.cliCommand(command, "00|", limit) != null
-            AlertDialog(
-                onDismissRequest = { panel = null },
-                title = { Text("Companion-CLI") },
-                confirmButton = {
-                    TextButton(onClick = {
-                        focusManager.clearFocus()
-                        waitingForCli = true
-                        reply = null
-                        cliError = null
-                        model.manageCompanion(status.session, CompanionAction.RunCli(command)) { result ->
-                            waitingForCli = false
-                            result.fold(
-                                onSuccess = { reply = it?.ifEmpty { "Leere Antwort" } },
-                                onFailure = { cliError = it.message },
-                            )
-                        }
-                    }, enabled = canSend) { Text("Ausführen") }
-                },
-                dismissButton = { TextButton(onClick = { panel = null }) { Text("Schließen") } },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (limit == null) {
-                            Text("Benötigt Companion-Protokollversion 14 oder höher.")
-                        } else {
-                            OutlinedTextField(
-                                value = command,
-                                onValueChange = { command = it },
-                                singleLine = true,
-                                label = { Text("Kommando") },
-                                placeholder = { Text("get name") },
-                                supportingText = { Text("${command.encodeToByteArray().size}/$limit UTF-8-Bytes") },
-                                enabled = !waitingForCli,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
-                        if (waitingForCli) Text("Warte auf die CLI-Antwort …")
-                        if (!status.available) Text("Companion erneut verbinden.")
-                        cliError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                        reply?.let { output ->
-                            Text(output, Modifier.heightIn(max = 180.dp).verticalScroll(rememberScrollState()),
-                                fontFamily = FontFamily.Monospace)
-                            TextButton(onClick = { reply = null; cliError = null }) { Text("Ausgabe löschen") }
-                        }
-                    }
-                },
-            )
-        }
+        CompanionPanel.CLI -> CompanionTerminal(
+            status = status,
+            terminal = model.cliTerminal(status.session),
+            onRun = { command, completed ->
+                model.manageCompanion(status.session, CompanionAction.RunCli(command), completed)
+            },
+            onDismiss = { panel = null },
+        )
+        CompanionPanel.POSITION -> CompanionPositionDialog(
+            current = status.position,
+            enabled = ready,
+            onSave = { position, completed ->
+                model.manageCompanion(status.session, CompanionAction.SetPosition(position)) { result ->
+                    if (result.isSuccess) feedback = Result.success("Position auf dem Companion gespeichert.")
+                    completed(result)
+                }
+            },
+            onDismiss = { panel = null },
+        )
+        CompanionPanel.LOCATION_SETTINGS -> CompanionLocationSettingsDialog(
+            status = status,
+            onAction = { action, completed -> model.manageCompanion(status.session, action, completed) },
+            onDismiss = { panel = null },
+        )
         null -> Unit
     }
 }

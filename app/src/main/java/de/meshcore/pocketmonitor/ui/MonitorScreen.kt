@@ -237,7 +237,8 @@ internal fun MonitorScreen(
                     }
                     tabState.SaveableStateProvider(if (messageTab == 0) "channels" else "private") {
                         ChannelView(model, companion, connection.channelError.takeIf { messageTab == 0 },
-                            Modifier.weight(1f), privateMessages = messageTab == 1, unread = unreadHere)
+                            Modifier.weight(1f), privateMessages = messageTab == 1, unread = unreadHere,
+                            channelManagement = connection.channelManagement)
                     }
                 } else if (selectedTab == 1) {
                     DiscoverView(

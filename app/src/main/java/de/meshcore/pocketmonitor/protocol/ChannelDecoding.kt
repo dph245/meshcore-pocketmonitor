@@ -36,6 +36,7 @@ internal class RadioChannel(val name: String, key: ByteArray) {
     companion object {
         private val publicKey = "8b3387e9c5cdea6ac9e5edbaa115cd72".hexToByteArray()
         val builtIn = RadioChannel("Public", publicKey)
+        fun publicKeyBytes() = publicKey.copyOf()
 
         fun restorePublic(name: String, identity: String): RadioChannel? {
             if (identity == builtIn.identity) return builtIn

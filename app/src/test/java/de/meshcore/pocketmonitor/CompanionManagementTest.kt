@@ -2,7 +2,9 @@ package de.meshcore.pocketmonitor
 
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionContact
+import de.meshcore.pocketmonitor.protocol.CompanionGps
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
+import de.meshcore.pocketmonitor.protocol.CompanionPosition
 import de.meshcore.pocketmonitor.protocol.ContactCategory
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -12,6 +14,60 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CompanionManagementTest {
+    @Test
+    fun selfAdvertRoutesHaveDistinctModeBytes() {
+        assertArrayEquals(byteArrayOf(0x07, 0x00), CompanionManagement.advertCommand(flood = false))
+        assertArrayEquals(byteArrayOf(0x07, 0x01), CompanionManagement.advertCommand(flood = true))
+    }
+
+    @Test
+    fun positionUsesSignedLittleEndianMicrodegrees() {
+        val position = checkNotNull(CompanionPosition.parse(" -1,234567 ", "2.345678"))
+        val command = "0e7929edffceca2300".hexToByteArray()
+        assertArrayEquals(command, CompanionManagement.positionCommand(position))
+        assertArrayEquals("0e0000000000000000".hexToByteArray(), CompanionManagement.positionCommand(CompanionPosition.ZERO))
+        val selfInfo = ByteArray(36).apply { this[0] = 0x05 } + command.copyOfRange(1, 9)
+        assertEquals(position, CompanionManagement.selfPosition(selfInfo))
+        assertNull(CompanionManagement.selfPosition(selfInfo.copyOf(43)))
+        assertNull(CompanionManagement.selfPosition(selfInfo.copyOf().apply { this[43] = 0x7f }))
+        assertEquals(CompanionPosition(-90_000_000, 180_000_000), CompanionPosition.parse("-90", "180"))
+        assertEquals(CompanionPosition(52_123_457, 13_000_000), CompanionPosition.fromDegrees(52.1234567, 13.0))
+        assertNull(CompanionPosition.parse("90.0000001", "1"))
+        assertNull(CompanionPosition.parse("0", "-180.0000001"))
+        assertNull(CompanionPosition.parse("NaN", "0"))
+    }
+
+    @Test
+    fun advertLocationCommandPreservesContactAndTelemetryFlagsAndOmitsMultiAck() {
+        val info = ByteArray(58).apply {
+            this[0] = 0x05
+            this[44] = 0x01
+            this[45] = 0x02
+            this[46] = 0x39
+            this[47] = 0xa5.toByte()
+        }
+        val settings = checkNotNull(CompanionManagement.advertLocationSettings(info))
+        assertTrue(settings.enabled)
+        assertArrayEquals("26a53900".hexToByteArray(), CompanionManagement.advertLocationCommand(settings, enabled = false))
+        assertArrayEquals("26a53901".hexToByteArray(), CompanionManagement.advertLocationCommand(settings, enabled = true))
+        assertNull(CompanionManagement.advertLocationSettings(info.copyOf(47)))
+        assertNull(CompanionManagement.advertLocationSettings(info.copyOf().apply { this[0] = 0x01 }))
+    }
+
+    @Test
+    fun gpsCustomVariableDistinguishesOnOffAndMissingModule() {
+        fun settings(value: String) = CompanionManagement.gpsSetting(byteArrayOf(0x15) + value.encodeToByteArray())
+        assertEquals(CompanionGps.ENABLED, settings("gps:1,gps_interval:10,meshtimesync:0"))
+        assertEquals(CompanionGps.DISABLED, settings("gps_interval:10,gps:0"))
+        assertEquals(CompanionGps.UNAVAILABLE, settings(""))
+        assertEquals(CompanionGps.UNAVAILABLE, settings("gps_interval:10"))
+        assertEquals(CompanionGps.UNKNOWN, settings("gps:"))
+        assertEquals(CompanionGps.UNKNOWN, settings("gps:1,gps:0"))
+        assertEquals(CompanionGps.UNKNOWN, CompanionManagement.gpsSetting(byteArrayOf(0x01, 0x01)))
+        assertArrayEquals(byteArrayOf(0x29) + "gps:1".encodeToByteArray(), CompanionManagement.gpsCommand(true))
+        assertArrayEquals(byteArrayOf(0x29) + "gps:0".encodeToByteArray(), CompanionManagement.gpsCommand(false))
+    }
+
     @Test
     fun defaultScopeUsesFixedUtf8FieldAndVerifiesReturnedNameAndKey() {
         val set = checkNotNull(CompanionManagement.scopeCommand(" grüße "))

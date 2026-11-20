@@ -27,9 +27,15 @@ import de.meshcore.pocketmonitor.protocol.HeardRepeater
 import de.meshcore.pocketmonitor.protocol.RepeaterAttribution
 import de.meshcore.pocketmonitor.protocol.RepeaterWindow
 import de.meshcore.pocketmonitor.protocol.ChannelDecoding
+import de.meshcore.pocketmonitor.protocol.ChannelChange
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
+import de.meshcore.pocketmonitor.protocol.ChannelReference
+import de.meshcore.pocketmonitor.protocol.reference
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
+import de.meshcore.pocketmonitor.protocol.AdvertLocationSettings
+import de.meshcore.pocketmonitor.protocol.CompanionGps
+import de.meshcore.pocketmonitor.protocol.CompanionPosition
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.CompanionRead
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol.Command
@@ -63,6 +69,7 @@ internal data class ConnectionStatus(
     val contacts: ContactStatus = ContactStatus(),
     val management: ManagementStatus? = null,
     val channelError: String? = null,
+    val channelManagement: ChannelManagementStatus? = null,
     val syncingMessages: Boolean = false,
     val messageSyncError: String? = null,
     val batteryMv: Int? = null,
@@ -71,12 +78,24 @@ internal data class ConnectionStatus(
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
 )
 
+internal data class ChannelManagementStatus(
+    val session: String,
+    val companion: String,
+    val channels: List<ChannelReference>,
+    val hasFreeSlot: Boolean,
+    val busy: Boolean,
+)
+
 internal data class ManagementStatus(
     val session: String,
     val scopeName: String?,
     val cliTextLimit: Int?,
     val busy: Boolean,
     val available: Boolean,
+    val position: CompanionPosition?,
+    val advertLocationEnabled: Boolean?,
+    val canSetAdvertLocation: Boolean,
+    val gps: CompanionGps,
 )
 
 private class ManagementTransaction(
@@ -85,7 +104,10 @@ private class ManagementTransaction(
 ) {
     var reply: CompanionRead? = null
     var verifyingScope: ByteArray? = null
+    var verifyingAdvertLocation = false
     var cliPrefix: String? = null
+    var channelChange: ChannelChange? = null
+    var verifyingChannel = false
 }
 
 internal data class GroupSender(
@@ -267,6 +289,9 @@ internal class CompanionConnection(private val context: Context, private val his
         private val discoverSession = UUID.randomUUID().toString()
         private var journalName: String? = null
         private var selfName: ByteArray? = null
+        private var selfPosition: CompanionPosition? = null
+        private var advertLocation: AdvertLocationSettings? = null
+        private var gps = CompanionGps.UNKNOWN
         private var group: GroupTransaction? = null
         private var privateTx: PrivateTransmission? = null
         private var privateCommand: PrivateCommand? = null
@@ -308,6 +333,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private var initialMetadataPending = true
         private var channelQuery: ChannelQuery? = null
         private val configuredSlots = mutableListOf<ChannelSlot>()
+        private val emptyChannelSlots = sortedSetOf<Int>()
         private var channelReadFailed = false
         private var defaultScope: FloodScope? = null
         private var scopeReadable = false
@@ -596,6 +622,8 @@ internal class CompanionConnection(private val context: Context, private val his
                     }
                     journalName = identity
                     selfName = GroupSend.selfName(frame.bytes)
+                    selfPosition = CompanionManagement.selfPosition(frame.bytes)
+                    advertLocation = CompanionManagement.advertLocationSettings(frame.bytes)
                 }
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     val version = frame.bytes.getOrNull(1)?.toInt()?.and(0xff) ?: 0
@@ -735,11 +763,9 @@ internal class CompanionConnection(private val context: Context, private val his
 
         fun refreshChannels() = guarded {
             val connection = gatt ?: return@guarded
-            if (initialMetadataPending || channelSlots == 0 || commandChannelUncertain || group != null || privateCommand != null ||
-                channelQuery != null || telemetryQuery != null || contactTransfer != null || messageSync != null ||
-                searches.history.value.busy || management != null || privatePathQuery != null
-            ) return@guarded
+            if (channelSlots == 0 || commandChannelUncertain || commandBusy() || privateTx != null) return@guarded
             configuredSlots.clear()
+            emptyChannelSlots.clear()
             nextSlot = 0
             channelReadFailed = false
             nextMetadataQuery(connection)
@@ -771,6 +797,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val frame = query.result ?: return
             clearTimeout()
             ChannelQuery.configuredSlot(frame)?.let(configuredSlots::add)
+            if (ChannelQuery.emptySlot(frame)) emptyChannelSlots.add(frame[1].toInt() and 0xff)
             if (frame.firstOrNull() == ChannelQuery.DEFAULT_FLOOD_SCOPE.toByte()) {
                 defaultScope = ChannelQuery.defaultScope(frame)
                 scopeReadable = frame.size == 1 || defaultScope != null
@@ -979,11 +1006,23 @@ internal class CompanionConnection(private val context: Context, private val his
                     CompanionManagement.cliTextLimit(mtu).takeIf { (firmwareVersion ?: 0) >= CompanionManagement.CLI_MIN_VERSION },
                     commandBusy() || privateTx != null,
                     !commandChannelUncertain,
+                    selfPosition,
+                    advertLocation?.enabled,
+                    (firmwareVersion ?: 0) >= CompanionManagement.LOCATION_PARAMS_MIN_VERSION,
+                    gps,
                 )
             } else null
             mutableStatus.value = state.copy(
                 contacts = contacts,
                 management = managementStatus,
+                channelManagement = if (id != null && catalog?.complete == true && state.active &&
+                    channelSlots > 0 && !groupBlocked && !commandChannelUncertain
+                ) {
+                    ChannelManagementStatus(
+                        discoverSession, id, catalog.slots.sortedBy { it.index }.map { it.reference() },
+                        emptyChannelSlots.isNotEmpty(), commandBusy() || privateTx != null,
+                    )
+                } else null,
                 discoverUnavailable = discoverUnavailable(),
             )
             mutablePrivateSender.value = if (id != null && mutableStatus.value.active &&
@@ -1095,7 +1134,14 @@ internal class CompanionConnection(private val context: Context, private val his
                 connection == null || state.management?.session != session -> "Companion ist nicht mehr verbunden."
                 commandChannelUncertain -> "Companion erneut verbinden."
                 commandBusy() || privateTx != null -> "Bitte den laufenden Companion-Vorgang abwarten."
+                action is CompanionAction.ResetPrivatePath && privateContact(action.key) == null ->
+                    "Kontakt ist auf diesem Companion nicht verfügbar."
                 action is CompanionAction.SetScope && !scopeReadable -> "Standard-Scope konnte nicht gelesen werden."
+                action is CompanionAction.SetAdvertLocation &&
+                    (firmwareVersion ?: 0) < CompanionManagement.LOCATION_PARAMS_MIN_VERSION ->
+                    "Die Standortfreigabe ist auf dieser Firmware nicht einstellbar."
+                action is CompanionAction.SetGpsEnabled && gps != CompanionGps.ENABLED && gps != CompanionGps.DISABLED ->
+                    "Der Companion meldet kein steuerbares GPS-Modul."
                 action is CompanionAction.RunCli && (firmwareVersion ?: 0) < CompanionManagement.CLI_MIN_VERSION ->
                     "Companion-CLI benötigt Protokollversion 14 oder höher."
                 (action is CompanionAction.AddContact || action is CompanionAction.RemoveContact) &&
@@ -1116,11 +1162,20 @@ internal class CompanionConnection(private val context: Context, private val his
             tx.cliPrefix = prefix
             val command = when (action) {
                 is CompanionAction.SetScope -> CompanionManagement.scopeCommand(action.name)
+                is CompanionAction.SendAdvert -> CompanionManagement.advertCommand(action.flood)
+                is CompanionAction.SetPosition -> CompanionManagement.positionCommand(action.position)
+                CompanionAction.ReadLocationSettings, is CompanionAction.SetAdvertLocation -> Command.APP_START.encode()
+                is CompanionAction.SetGpsEnabled -> CompanionManagement.gpsCommand(action.enabled)
                 is CompanionAction.AddContact -> CompanionManagement.addContact(action)
                 is CompanionAction.RemoveContact -> CompanionManagement.removeContact(action.key)
+                is CompanionAction.ResetPrivatePath -> PrivateSend.resetPath(action.key)
                 is CompanionAction.RunCli -> CompanionManagement.cliCommand(
                     action.text, checkNotNull(prefix), CompanionManagement.cliTextLimit(mtu),
                 )
+                is CompanionAction.EditChannel -> {
+                    prepareChannelChange(connection, action, tx)
+                    return@guarded
+                }
             }
             if (command == null) {
                 finishManagement(error = when (action) {
@@ -1133,11 +1188,48 @@ internal class CompanionConnection(private val context: Context, private val his
             when (action) {
                 is CompanionAction.AddContact, is CompanionAction.RemoveContact ->
                     prepareContactChange(connection, action, command)
-                is CompanionAction.SetScope ->
-                    writeManagement(connection, CompanionRead(command, CompanionProtocol.OK))
+                CompanionAction.ReadLocationSettings, is CompanionAction.SetAdvertLocation -> {
+                    advertLocation = null
+                    if (action == CompanionAction.ReadLocationSettings) gps = CompanionGps.UNKNOWN
+                    writeManagement(connection, CompanionRead(command, Command.APP_START.expectedReply))
+                }
                 is CompanionAction.RunCli ->
                     writeManagement(connection, CompanionRead(command, CompanionManagement.CLI_REPLY))
+                else -> writeManagement(connection, CompanionRead(command, CompanionProtocol.OK))
             }
+        }
+
+        private fun prepareChannelChange(
+            connection: BluetoothGatt, action: CompanionAction.EditChannel, tx: ManagementTransaction,
+        ) {
+            val catalog = mutableStatus.value.channelManagement
+            if (catalog == null) {
+                finishManagement(error = "Die Kanalliste ist nicht verfügbar.")
+                return
+            }
+            val change = when (action) {
+                is CompanionAction.EditChannel.Add -> {
+                    if (catalog.channels.any { it.identity == action.channel.identity }) {
+                        finishManagement(error = "Ein Kanal mit diesem Schlüssel ist bereits eingerichtet.")
+                        return
+                    }
+                    val slot = emptyChannelSlots.firstOrNull()
+                    if (slot == null) {
+                        finishManagement(error = "Auf dem Companion ist kein Kanal-Slot frei.")
+                        return
+                    }
+                    action.channel.change(slot)
+                }
+                is CompanionAction.EditChannel.Remove -> {
+                    if (action.channel !in catalog.channels) {
+                        finishManagement(error = "Dieser Kanal ist auf dem Companion nicht mehr verfügbar.")
+                        return
+                    }
+                    ChannelChange.remove(action.channel)
+                }
+            }
+            tx.channelChange = change
+            writeManagement(connection, ChannelQuery(change.slot))
         }
 
         private fun prepareContactChange(connection: BluetoothGatt, action: CompanionAction, command: ByteArray) {
@@ -1167,6 +1259,8 @@ internal class CompanionConnection(private val context: Context, private val his
                 timeout = Runnable {
                     finishManagement(error = "Keine passende Companion-Antwort. Ausführung unbestätigt.", uncertain = true)
                 }.also { handler.postDelayed(it, 5_000) }
+            } else if (tx.verifyingChannel) {
+                channelChangeUnconfirmed("Kanaländerung angenommen. Slot konnte nicht zurückgelesen werden.")
             } else {
                 val message = if (tx.verifyingScope != null) {
                     updateDefaultScope(null)
@@ -1183,12 +1277,67 @@ internal class CompanionConnection(private val context: Context, private val his
             clearTimeout()
             tx.reply = null
             val code = frame.firstOrNull()?.toInt()?.and(0xff)
+            val channelChange = tx.channelChange
+            if (channelChange != null && reply is ChannelQuery) {
+                channelChangeProgress(connection, tx, channelChange, frame)
+                return
+            }
             if (tx.verifyingScope == null && (code == CompanionProtocol.ERROR || code == CompanionProtocol.DISABLED)) {
                 val number = frame.getOrNull(1)?.toInt()?.and(0xff)
                 finishManagement(error = "Companion hat den Befehl abgelehnt${number?.let { " (Code $it)" }.orEmpty()}.")
                 return
             }
             when (val action = tx.action) {
+                CompanionAction.ReadLocationSettings -> {
+                    if (reply.command[0].toInt() == Command.APP_START.code) {
+                        updateLocationFromSelfInfo(frame)
+                        readCompanionGps(connection)
+                    } else {
+                        gps = CompanionManagement.gpsSetting(frame)
+                        finishManagement(error = when {
+                            gps == CompanionGps.UNKNOWN -> "GPS-Status konnte nicht gelesen werden."
+                            advertLocation == null -> "Standortfreigabe konnte nicht gelesen werden."
+                            else -> null
+                        })
+                    }
+                }
+                is CompanionAction.SetAdvertLocation -> {
+                    if (reply.command[0].toInt() == Command.APP_START.code) {
+                        updateLocationFromSelfInfo(frame)
+                        val current = advertLocation
+                        when {
+                            tx.verifyingAdvertLocation -> finishManagement(
+                                error = if (current?.enabled == action.enabled) null
+                                    else "Der Companion hat die Standortfreigabe nicht bestätigt.",
+                            )
+                            current == null -> finishManagement(error = "Standortfreigabe konnte nicht gelesen werden.")
+                            current.enabled == action.enabled -> finishManagement()
+                            else -> writeManagement(connection, CompanionRead(
+                                CompanionManagement.advertLocationCommand(current, action.enabled), CompanionProtocol.OK,
+                            ))
+                        }
+                    } else if (code == CompanionProtocol.OK && frame.size == 1) {
+                        advertLocation = null
+                        tx.verifyingAdvertLocation = true
+                        writeManagement(connection, CompanionRead(Command.APP_START.encode(), Command.APP_START.expectedReply))
+                    } else {
+                        advertLocation = null
+                        finishManagement(error = "Ungültige Bestätigung der Standortfreigabe.")
+                    }
+                }
+                is CompanionAction.SetGpsEnabled -> {
+                    if (reply.command[0] == CompanionManagement.GET_CUSTOM_VARS) {
+                        gps = CompanionManagement.gpsSetting(frame)
+                        val expected = if (action.enabled) CompanionGps.ENABLED else CompanionGps.DISABLED
+                        finishManagement(error = if (gps == expected) null else "Der Companion hat den GPS-Status nicht bestätigt.")
+                    } else if (code == CompanionProtocol.OK && frame.size == 1) {
+                        gps = CompanionGps.UNKNOWN
+                        readCompanionGps(connection)
+                    } else {
+                        gps = CompanionGps.UNKNOWN
+                        finishManagement(error = "Ungültige Bestätigung des GPS-Status.")
+                    }
+                }
                 is CompanionAction.SetScope -> {
                     val requested = tx.verifyingScope
                     if (requested == null) {
@@ -1203,9 +1352,79 @@ internal class CompanionConnection(private val context: Context, private val his
                 }
                 is CompanionAction.AddContact, is CompanionAction.RemoveContact ->
                     verifyContactChange(connection, action, reply.command)
+                is CompanionAction.SendAdvert, is CompanionAction.SetPosition -> {
+                    if (code != CompanionProtocol.OK || frame.size != 1) {
+                        finishManagement(error = "Ungültige Bestätigung vom Companion.")
+                        return
+                    }
+                    if (action is CompanionAction.SetPosition) selfPosition = action.position
+                    finishManagement()
+                }
+                is CompanionAction.ResetPrivatePath -> {
+                    if (code != CompanionProtocol.OK || frame.size != 1) {
+                        finishManagement(error = "Ungültige Bestätigung für den Pfad-Reset.")
+                        return
+                    }
+                    installedPrivateRoutes.edit().remove(privateRouteKey(action.key)).apply()
+                    queuePrivatePathRefresh(action.key)
+                    finishManagement()
+                }
                 is CompanionAction.RunCli ->
                     finishManagement(output = CompanionManagement.cliReply(frame, checkNotNull(tx.cliPrefix)))
+                is CompanionAction.EditChannel -> {
+                    if (code != CompanionProtocol.OK || frame.size != 1) {
+                        channelChangeUnconfirmed("Ungültige Bestätigung der Kanaländerung.")
+                        return
+                    }
+                    tx.verifyingChannel = true
+                    writeManagement(connection, ChannelQuery(checkNotNull(tx.channelChange).slot))
+                }
             }
+        }
+
+        private fun channelChangeProgress(
+            connection: BluetoothGatt, tx: ManagementTransaction, change: ChannelChange, frame: ByteArray,
+        ) {
+            if (!tx.verifyingChannel) {
+                if (change.matchesBefore(frame)) {
+                    writeManagement(connection, CompanionRead(change.command, CompanionProtocol.OK))
+                } else {
+                    channelChangeUnconfirmed("Der Companion meldet einen anderen Slot-Inhalt. Aktion bitte erneut auswählen.")
+                }
+                return
+            }
+            if (!change.matchesAfter(frame)) {
+                channelChangeUnconfirmed("Der Companion hat die Kanaländerung nicht bestätigt.")
+                return
+            }
+            configuredSlots.removeAll { it.index == change.slot }
+            emptyChannelSlots.remove(change.slot)
+            val slot = ChannelQuery.configuredSlot(frame)
+            if (slot == null) emptyChannelSlots.add(change.slot)
+            else {
+                configuredSlots.add(slot)
+                configuredSlots.sortBy { it.index }
+            }
+            finishMetadata()
+            finishManagement()
+        }
+
+        private fun channelChangeUnconfirmed(message: String) {
+            groupBlocked = true
+            finishManagement(error = message)
+            refreshChannels()
+        }
+
+        private fun updateLocationFromSelfInfo(frame: ByteArray) {
+            if (CompanionProtocol.selfIdentity(frame) != journalName) return
+            advertLocation = CompanionManagement.advertLocationSettings(frame)
+            CompanionManagement.selfPosition(frame)?.let { selfPosition = it }
+        }
+
+        private fun readCompanionGps(connection: BluetoothGatt) {
+            writeManagement(connection, CompanionRead(
+                byteArrayOf(CompanionManagement.GET_CUSTOM_VARS), CompanionManagement.CUSTOM_VARS,
+            ))
         }
 
         private fun updateDefaultScope(frame: ByteArray?) {
@@ -1238,6 +1457,8 @@ internal class CompanionConnection(private val context: Context, private val his
             if (uncertain) {
                 commandChannelUncertain = true
                 if (tx.action is CompanionAction.SetScope) updateDefaultScope(null)
+                if (tx.action is CompanionAction.SetAdvertLocation) advertLocation = null
+                if (tx.action is CompanionAction.SetGpsEnabled) gps = CompanionGps.UNKNOWN
             }
             val contacts = mutableStatus.value.contacts
             publishCommandState(if (uncertain) contacts.copy(canRefresh = false) else contacts)
@@ -1311,13 +1532,13 @@ internal class CompanionConnection(private val context: Context, private val his
                 step == PrivateSendStep.RESET_PATH ->
                     writePrivate(tx, PrivateStage.RESET_PATH, PrivateSend.resetPath(tx.key))
                 tx.options.activeRoute != null || tx.options.floodScope != GroupSend.DEFAULT || tx.retry.floodPhase ||
-                    installedPrivateRoutes.contains(privateRouteKey(tx)) ->
+                    installedPrivateRoutes.contains(privateRouteKey(tx.key)) ->
                     writePrivate(tx, PrivateStage.READ_PATH, PrivateSend.readContact(tx.key))
                 else -> sendPrivateAttempt(tx)
             }
         }
 
-        private fun privateRouteKey(tx: PrivateTransmission) = "${checkNotNull(journalName)}/${tx.key}"
+        private fun privateRouteKey(key: String) = "${checkNotNull(journalName)}/$key"
 
         @SuppressLint("UseKtx") // The KTX helper discards the commit result.
         private fun recordPrivateRoute(key: String, signatures: Set<String> = emptySet()): Boolean {
@@ -1343,7 +1564,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 return
             }
             val route = tx.options.activeRoute.takeUnless { tx.retry.floodPhase }
-            val routeKey = privateRouteKey(tx)
+            val routeKey = privateRouteKey(tx.key)
             when (command.stage) {
                 PrivateStage.VERIFY_DIRECT -> {
                     if (route?.signature == signature && !flood) sendPrivateAttempt(tx, flood = false)
