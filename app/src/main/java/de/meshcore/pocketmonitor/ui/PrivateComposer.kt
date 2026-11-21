@@ -3,6 +3,7 @@ package de.meshcore.pocketmonitor.ui
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -16,6 +17,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import de.meshcore.pocketmonitor.ble.PrivateSender
 import de.meshcore.pocketmonitor.protocol.GroupSend
@@ -37,7 +41,15 @@ internal fun PrivateComposer(
         onValueChange = changeDraft,
         modifier = Modifier.fillMaxWidth(),
         label = { Text("Private Nachricht") },
-        supportingText = { Text("${size ?: 0} / $limit Bytes") },
+        supportingText = {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("${size ?: 0} / $limit Bytes")
+                // Keep the status measured even when idle so the composer height stays stable.
+                val statusVisibility = if (sender?.busy == true) Modifier
+                    else Modifier.alpha(0f).clearAndSetSemantics { }
+                Text("Companion beschäftigt", Modifier.weight(1f).then(statusVisibility), textAlign = TextAlign.End)
+            }
+        },
         isError = size != null && size > limit,
         maxLines = 4,
     )
@@ -62,7 +74,6 @@ internal fun PrivateComposer(
                 Text("Pfad zurücksetzen")
             }
         }
-        if (sender?.busy == true) Text("Companion beschäftigt", style = MaterialTheme.typography.bodySmall)
     }
     if (showOptions) {
         PrivateSendOptionsDialog(options, sender, onSave = {
