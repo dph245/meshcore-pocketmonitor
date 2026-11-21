@@ -59,8 +59,10 @@ internal class DiscoverSearches(private val nextTag: () -> UInt = { Random.nextI
         return run
     }
 
-    fun endCooldown(elapsedMs: Long) {
-        if (elapsedMs >= cooldownUntilMs) mutableHistory.value = history.value.copy(coolingDown = false)
+    fun updateCooldown(elapsedMs: Long): Long {
+        val remainingMs = (cooldownUntilMs - elapsedMs).coerceAtLeast(0)
+        if (remainingMs == 0L) mutableHistory.value = history.value.copy(coolingDown = false)
+        return remainingMs
     }
 
     fun accept(elapsedMs: Long) = updateLatest { run ->

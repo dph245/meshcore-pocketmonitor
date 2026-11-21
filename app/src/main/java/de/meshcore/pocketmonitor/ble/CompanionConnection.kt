@@ -211,6 +211,12 @@ internal class CompanionConnection(private val context: Context, private val his
     val liveRepeaters = mutableLiveRepeaters.asStateFlow()
     private val searches = DiscoverSearches()
     val discover = searches.history
+    private val discoverCooldownTimer = object : Runnable {
+        override fun run() {
+            val remainingMs = searches.updateCooldown(SystemClock.elapsedRealtime())
+            if (remainingMs > 0) handler.postDelayed(this, remainingMs)
+        }
+    }
     private val mutableTraces = MutableStateFlow<List<TraceRun>>(emptyList())
     val traces = mutableTraces.asStateFlow()
 
@@ -2106,9 +2112,8 @@ internal class CompanionConnection(private val context: Context, private val his
             val run = searches.start(
                 discoverSession, System.currentTimeMillis(), SystemClock.elapsedRealtime(), contacts.resolverFor(journalName),
             ) ?: return@guarded
-            handler.postDelayed(
-                { searches.endCooldown(SystemClock.elapsedRealtime()) }, DiscoverSearches.COOLDOWN_MS,
-            )
+            handler.removeCallbacks(discoverCooldownTimer)
+            discoverCooldownTimer.run()
             discoverReply = DiscoverCommandReply()
             publishCommandState()
             timeout = Runnable {
