@@ -229,21 +229,50 @@ internal class CompanionConnection(private val context: Context, private val his
 
     private var current: Session? = null
     private var previousWriter: Job? = null
+    private var requestedDevice: CompanionDevice? = null
+    private var onStopped: (() -> Unit)? = null
+    private var connectedOnce = false
+    private var retryDelaySeconds = 2L
+    private val reconnect = Runnable { requestedDevice?.let(::startSession) }
 
-    fun connect(device: CompanionDevice) {
+    fun connect(device: CompanionDevice, stopped: () -> Unit) {
         handler.post {
-            if (current == null) {
-                val session = Session(device)
-                current = session
-                channelCatalog = null
-                historyError = null
-                session.start()
+            if (requestedDevice == null) {
+                requestedDevice = device
+                onStopped = stopped
+                connectedOnce = false
+                retryDelaySeconds = 2
+                startSession(device)
             }
         }
     }
 
+    private fun startSession(device: CompanionDevice) {
+        channelCatalog = null
+        historyError = null
+        val session = Session(device)
+        current = session
+        session.start()
+    }
+
     fun disconnect() {
-        handler.post { current?.finish("Getrennt") }
+        handler.post {
+            handler.removeCallbacks(reconnect)
+            val session = current
+            if (session != null) {
+                session.finish("Getrennt")
+            } else if (requestedDevice != null) {
+                mutableStatus.value = ConnectionStatus()
+                stopReceiving()
+            }
+        }
+    }
+
+    private fun stopReceiving() {
+        requestedDevice = null
+        val stopped = onStopped
+        onStopped = null
+        stopped?.invoke()
     }
 
     fun refreshContacts() {
@@ -289,13 +318,6 @@ internal class CompanionConnection(private val context: Context, private val his
             val connection = current
             if (connection == null) completed("Companion ist nicht verbunden.")
             else connection.sendGroup(session, companion, channel, text, scope, completed)
-        }
-    }
-
-    fun close() {
-        handler.post {
-            current?.finish("Getrennt")
-            thread.quitSafely()
         }
     }
 
@@ -371,15 +393,15 @@ internal class CompanionConnection(private val context: Context, private val his
             waitFor("Verbinde mit ${device.name} …", 20_000)
             gatt = device.device.connectGatt(context, false, this, BluetoothDevice.TRANSPORT_LE,
                 BluetoothDevice.PHY_LE_1M_MASK, handler)
-            if (gatt == null) finish("GATT-Verbindung konnte nicht gestartet werden.", error = true)
+            if (gatt == null) finish("GATT-Verbindung konnte nicht gestartet werden.", error = true, retry = true)
         }
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) = guarded {
             when {
                 status != BluetoothGatt.GATT_SUCCESS ->
-                    finish("BLE-Verbindung beendet (GATT $status).", error = true)
+                    finish("BLE-Verbindung beendet (GATT $status).", error = true, retry = true)
                 newState == BluetoothProfile.STATE_DISCONNECTED ->
-                    finish("Companion hat die Verbindung getrennt.")
+                    finish("Companion hat die Verbindung getrennt.", retry = true)
                 newState == BluetoothProfile.STATE_CONNECTED -> {
                     waitFor("Handle BLE-MTU aus …", 10_000)
                     if (!gatt.requestMtu(CompanionProtocol.REQUESTED_MTU)) {
@@ -683,6 +705,8 @@ internal class CompanionConnection(private val context: Context, private val his
             when (command) {
                 Command.APP_START -> send(gatt, Command.DEVICE_QUERY)
                 Command.DEVICE_QUERY -> {
+                    connectedOnce = true
+                    retryDelaySeconds = 2
                     pending = null
                     clearTimeout()
                     val limit = if (mtu < CompanionProtocol.FULL_FRAME_MTU) " · lange Frames ggf. unvollständig" else ""
@@ -2162,7 +2186,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private fun waitFor(message: String, millis: Long) {
             clearTimeout()
             mutableStatus.value = ConnectionStatus(message, active = true)
-            timeout = Runnable { finish("Zeitüberschreitung bei „$message“", error = true) }
+            timeout = Runnable { finish("Zeitüberschreitung bei „$message“", error = true, retry = true) }
                 .also { handler.postDelayed(it, millis) }
         }
 
@@ -2178,11 +2202,11 @@ internal class CompanionConnection(private val context: Context, private val his
             } catch (_: SecurityException) {
                 finish("Bluetooth-Berechtigung fehlt.", error = true)
             } catch (_: IllegalStateException) {
-                finish("Bluetooth-Verbindung ist nicht mehr verfügbar.", error = true)
+                finish("Bluetooth-Verbindung ist nicht mehr verfügbar.", error = true, retry = true)
             }
         }
 
-        fun finish(message: String, error: Boolean = false) {
+        fun finish(message: String, error: Boolean = false, retry: Boolean = false) {
             if (current !== this) return
             current = null
             handler.removeCallbacks(publishRepeaters)
@@ -2235,7 +2259,19 @@ internal class CompanionConnection(private val context: Context, private val his
             val syncError = if (state.syncingMessages || (state.active && messagesWaiting)) {
                 "Nachrichtenabgleich unterbrochen. Beim nächsten Verbinden wird die restliche Warteschlange abgerufen."
             } else state.messageSyncError
-            mutableStatus.value = ConnectionStatus(message, error = error, messageSyncError = syncError)
+            if (retry && connectedOnce) {
+                val delaySeconds = retryDelaySeconds
+                retryDelaySeconds = (delaySeconds * 2).coerceAtMost(30)
+                mutableStatus.value = ConnectionStatus(
+                    "Verbindung zu ${device.name} unterbrochen · neuer Versuch in ${delaySeconds} s",
+                    active = true,
+                    messageSyncError = syncError,
+                )
+                handler.postDelayed(reconnect, delaySeconds * 1_000)
+            } else {
+                mutableStatus.value = ConnectionStatus(message, error = error, messageSyncError = syncError)
+                stopReceiving()
+            }
         }
     }
 }

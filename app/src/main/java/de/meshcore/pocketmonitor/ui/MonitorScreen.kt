@@ -76,6 +76,8 @@ import java.util.Locale
 internal fun MonitorScreen(
     model: MonitorViewModel,
     onScan: () -> Unit,
+    onConnect: () -> Unit,
+    openMessagesRequest: Int,
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
 ) {
@@ -92,6 +94,13 @@ internal fun MonitorScreen(
     val liveList = rememberLazyListState()
     val liveState = remember(liveList) { LiveViewState(liveList) }
     var selectedTab by rememberSaveable { mutableIntStateOf(3) }
+    var handledMessagesRequest by remember { mutableIntStateOf(0) }
+    LaunchedEffect(openMessagesRequest) {
+        if (openMessagesRequest != handledMessagesRequest) {
+            selectedTab = 2
+            handledMessagesRequest = openMessagesRequest
+        }
+    }
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var discoverTab by rememberSaveable { mutableIntStateOf(0) }
@@ -156,7 +165,7 @@ internal fun MonitorScreen(
                                 enabled = !connection.active,
                             ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
                             Button(
-                                onClick = if (connection.active) model::disconnect else model::connect,
+                                onClick = if (connection.active) model::disconnect else onConnect,
                                 enabled = connection.active || (historyReady && scan.selected != null),
                             ) { Text(if (connection.active) "Trennen" else "Verbinden") }
                         }

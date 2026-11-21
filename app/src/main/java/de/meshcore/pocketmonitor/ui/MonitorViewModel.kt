@@ -2,6 +2,8 @@ package de.meshcore.pocketmonitor.ui
 
 import android.app.Application
 import android.content.Context
+import de.meshcore.pocketmonitor.CompanionReceiveService
+import de.meshcore.pocketmonitor.PocketMonitorApplication
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
 import de.meshcore.pocketmonitor.protocol.TracePath
 import de.meshcore.pocketmonitor.protocol.PrivateRoute
@@ -25,7 +27,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import de.meshcore.pocketmonitor.ble.CompanionConnection
 import de.meshcore.pocketmonitor.ble.CompanionDevice
 import de.meshcore.pocketmonitor.ble.CompanionScanner
 import de.meshcore.pocketmonitor.rx.JournalSnapshot
@@ -44,7 +45,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     private val history = CompanionHistory.get(application)
     private val preferences = application.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
     private val livePreferences = application.getSharedPreferences("live_preferences", Context.MODE_PRIVATE)
-    private val connection = CompanionConnection(application, history)
+    private val connection = (application as PocketMonitorApplication).connection
     private var terminal: CliTerminalState? = null
     private val mutableCompanions = MutableStateFlow<List<KnownCompanion>>(emptyList())
     val companions = mutableCompanions.asStateFlow()
@@ -136,8 +137,9 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
                     emptyList()
                 }
             }
-            mutableCompanions.value = known
-            mutableSelectedCompanion.value = known.firstOrNull()?.id
+            val connected = connection.companion.value?.takeIf { connectionStatus.value.active }
+            mutableCompanions.value = listOfNotNull(connected) + known.filter { it.id != connected?.id }
+            mutableSelectedCompanion.value = connected?.id ?: known.firstOrNull()?.id
             mutableHistoryReady.value = true
             while (true) {
                 delay(60_000)
@@ -183,14 +185,23 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
         mutableScan.value = scan.value.copy(selected = device)
     }
 
-    fun connect() {
-        if (!historyReady.value) return
-        val device = scan.value.selected ?: return
+    fun connect(): Boolean {
+        if (!historyReady.value || connectionStatus.value.active) return false
+        val device = scan.value.selected ?: return false
         stopScan()
-        connection.connect(device)
+        return try {
+            CompanionReceiveService.start(getApplication(), device)
+            true
+        } catch (_: SecurityException) {
+            permissionDenied()
+            false
+        } catch (_: IllegalStateException) {
+            mutableScan.value = scan.value.copy(message = "Hintergrundempfang konnte nicht gestartet werden.")
+            false
+        }
     }
 
-    fun disconnect() = connection.disconnect()
+    fun disconnect() = CompanionReceiveService.stop(getApplication())
 
     fun watchPrivatePath(session: String, key: String, watching: Boolean) =
         connection.watchPrivatePath(session, key, watching)
@@ -308,6 +319,5 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     override fun onCleared() {
         scanner.stop()
-        connection.close()
     }
 }

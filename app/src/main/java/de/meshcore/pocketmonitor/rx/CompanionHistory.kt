@@ -265,6 +265,16 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         return result
     }
 
+    fun newestMessageId(): Long =
+        db.rawQuery("SELECT id FROM message ORDER BY id DESC LIMIT 1", null)
+            .use { if (it.moveToFirst()) it.getLong(0) else 0 }
+
+    fun newestUnreadMessageAfter(id: Long): Long = db.rawQuery("""
+        SELECT id FROM message
+        WHERE id > ? AND unread = 1 AND ${visibleConversation("message.companion", "message.channel")}
+        ORDER BY id DESC LIMIT 1
+    """, arrayOf(id.toString())).use { if (it.moveToFirst()) it.getLong(0) else id }
+
     private fun visibleConversation(companion: String, identity: String): String = """
         ($identity NOT LIKE '${PRIVATE_ID_PREFIX}%' OR NOT EXISTS (
             SELECT 1 FROM contact_type WHERE contact_type.companion = $companion
