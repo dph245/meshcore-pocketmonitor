@@ -592,10 +592,6 @@ private fun MessageActions(
     onDetails: ((Long) -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
-    if (onReply == null) {
-        Box(modifier) { content() }
-        return
-    }
     val clipboard = LocalClipboard.current
     val coroutineScope = rememberCoroutineScope()
     var expanded by remember { mutableStateOf(false) }
@@ -604,7 +600,7 @@ private fun MessageActions(
         content()
         if (expanded) {
             DropdownMenu(expanded = true, onDismissRequest = { expanded = false }) {
-                if (message.outgoing == null) {
+                if (onReply != null && message.outgoing == null) {
                     val nickname = message.sender?.takeIf { it.isNotBlank() }
                     DropdownMenuItem(text = { Text("Antworten") }, enabled = nickname != null, onClick = {
                         expanded = false
