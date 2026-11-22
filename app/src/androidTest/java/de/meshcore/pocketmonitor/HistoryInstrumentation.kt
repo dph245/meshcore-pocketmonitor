@@ -67,8 +67,9 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyGroupSend()
                 verifyPrivateSend()
                 verifyPrivateAttemptMigration()
+                verifyArchiveDeletion()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, deduplication, retention, legacy import, queue synchronization, private RX and TX, group send, repeats, migration and paging\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, private RX and TX, group send, repeats, migration and paging\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -344,6 +345,7 @@ class HistoryInstrumentation : Instrumentation() {
                 val db = helper.writableDatabase
                 db.execSQL("ALTER TABLE private_send DROP COLUMN attempts")
                 db.execSQL("ALTER TABLE private_send DROP COLUMN last_route")
+                db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
                 db.version = 7
             }
             HistoryDatabase(targetContext, file).use { helper ->
@@ -352,6 +354,40 @@ class HistoryInstrumentation : Instrumentation() {
                     it.text == "Bestätigt" && it.privateSend == PrivateSendStatus.ACKNOWLEDGED &&
                         it.privateProgressLabel == null
                 })
+            }
+        } finally {
+            targetContext.deleteDatabase(file)
+        }
+    }
+
+    private fun verifyArchiveDeletion() {
+        val file = "archive-deletion-${UUID.randomUUID()}.db"
+        val frame = RxFrame(now, publicFrame)
+        val sample = listOf(Received(1, frame))
+        val slots = listOf(ChannelSlot(0, public))
+        try {
+            HistoryDatabase(targetContext, file).use { helper ->
+                val history = CompanionHistory(helper)
+                history.register(id, "Companion", now)
+                history.register(other, "Zweiter Companion", now)
+                history.configure(id, slots, complete = true)
+                history.append(id, "archive", sample, ChannelDecoding.default)
+                history.append(other, "other-archive", sample, ChannelDecoding.default)
+                check(!history.deleteArchivedChannel(id, public.identity))
+                history.configure(id, emptyList(), complete = true)
+                check(history.deleteArchivedChannel(id, public.identity))
+                check(!history.deleteArchivedChannel(id, public.identity))
+                check(history.channels(id).isEmpty())
+                check(history.messages(other, public.identity, null).rows.size == 1)
+                val retained = history.journal(id, null, null, null).newestRadioFirst.single()
+                check(retained.frame.bytes.contentEquals(publicFrame))
+                check(history.pendingRadio(id, 0, retained.sequence).isEmpty())
+                val decoded = checkNotNull(decodeMessage(frame, ChannelDecoding.default))
+                history.linkDecoded(id, listOf(retained.sequence to decoded))
+                check(history.channels(id).isEmpty())
+                history.configure(id, slots, complete = true)
+                history.append(id, "new-reception", sample, ChannelDecoding.default)
+                check(history.messages(id, public.identity, null).rows.single().receptionCount == 1L)
             }
         } finally {
             targetContext.deleteDatabase(file)
@@ -387,6 +423,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("DROP TABLE contact_type")
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_wire_time")
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_scope_dirty")
+                db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
                 db.version = 2
             }
             val firstId = HistoryDatabase(targetContext, file).use { helper ->

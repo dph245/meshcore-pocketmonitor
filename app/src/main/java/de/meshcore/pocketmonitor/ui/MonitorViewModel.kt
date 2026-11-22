@@ -235,6 +235,9 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun historyChannels(companion: String, private: Boolean) = history.channels(companion, private = private)
 
+    suspend fun deleteArchivedChannel(companion: String, identity: String) =
+        withContext(Dispatchers.IO) { history.deleteArchivedChannel(companion, identity) }
+
     fun conversationOrder(privateMessages: Boolean): ConversationOrder {
         val saved = preferences.getString(conversationOrderKey(privateMessages), null)
         return ConversationOrder.entries.firstOrNull { it.name == saved } ?: ConversationOrder.ALPHABETICAL

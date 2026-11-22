@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import de.meshcore.pocketmonitor.protocol.CompanionContact
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 8) {
+    SQLiteOpenHelper(context, name, null, 9) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -46,6 +46,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
                 id INTEGER PRIMARY KEY AUTOINCREMENT, companion TEXT NOT NULL REFERENCES companion(id),
                 session TEXT NOT NULL, ordinal INTEGER NOT NULL, received_at INTEGER NOT NULL,
                 code INTEGER, frame BLOB NOT NULL, message_id INTEGER REFERENCES message(id),
+                message_discarded INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (session, ordinal)
             )
         """)
@@ -87,6 +88,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
             """)
         }
         if (oldVersion < 8) addPrivateSendProgress(db)
+        if (oldVersion < 9) db.execSQL("ALTER TABLE rx ADD COLUMN message_discarded INTEGER NOT NULL DEFAULT 0")
     }
 
     private fun createContactTypes(db: SQLiteDatabase) {

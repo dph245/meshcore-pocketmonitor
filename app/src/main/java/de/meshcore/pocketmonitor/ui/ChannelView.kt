@@ -48,6 +48,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import de.meshcore.pocketmonitor.ble.PrivateSender
 import de.meshcore.pocketmonitor.ble.ChannelManagementStatus
+import de.meshcore.pocketmonitor.protocol.ChannelReference
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import androidx.lifecycle.repeatOnLifecycle
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
@@ -144,6 +145,14 @@ internal fun ChannelView(
     val closeConversation = { selectedIdentity = null }
     var managementSession by remember(companion) { mutableStateOf<String?>(null) }
     val liveManagement = channelManagement?.takeIf { it.companion == companion && !privateMessages }
+    var channelAction by remember(companion) { mutableStateOf<ChannelListAction?>(null) }
+    var actionSession by remember(companion) { mutableStateOf<String?>(null) }
+    if (companion != null) channelAction?.let { action ->
+        ChannelActionDialog(
+            action, liveManagement?.takeIf { action is ChannelListAction.Delete || it.session == actionSession },
+            model, companion, onDismiss = { channelAction = null },
+        )
+    }
     managementSession?.let { session ->
         ChannelManagementDialog(
             status = liveManagement?.takeIf { it.session == session },
@@ -206,34 +215,53 @@ internal fun ChannelView(
                         item { Text(if (contactQuery.isNotBlank()) "Keine passenden Kontakte." else "Keine privaten Unterhaltungen.") }
                     }
                     items(visibleChannels, key = { it.channel.identity }) { (item, last) ->
-                        Column(
-                            Modifier.fillMaxWidth().clickable {
-                                selectedIdentity = item.identity
-                            }.padding(horizontal = 4.dp, vertical = 10.dp),
-                        ) {
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                        var menuOpen by remember { mutableStateOf(false) }
+                        val installed = if (liveManagement != null) {
+                            liveManagement.channels.firstOrNull { it.identity == item.identity }
+                        } else item.slot?.let { ChannelReference(it, item.name, item.identity) }
+                        val openConversation = { selectedIdentity = item.identity }
+                        val interaction = if (privateMessages) Modifier.clickable(onClick = openConversation)
+                        else Modifier.combinedClickable(
+                            onClick = openConversation,
+                            onLongClickLabel = "Kanalmenü",
+                            onLongClick = { menuOpen = true },
+                        )
+                        Box {
+                            Column(
+                                Modifier.fillMaxWidth().then(interaction).padding(horizontal = 4.dp, vertical = 10.dp),
                             ) {
-                                if (item.identity in unread) UnreadDot()
-                                Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                when {
-                                    privateMessages ->
-                                        Text(item.identity.substringAfterLast(':').take(12), style = MaterialTheme.typography.labelSmall)
-                                    item.slot == null && !item.identity.startsWith("slot:") -> Text("Archiv · ${item.identity.take(8)}", style = MaterialTheme.typography.labelSmall)
-                                    item.slot != null && channels.count { it.channel.name == item.name } > 1 ->
-                                        Text("Slot ${item.slot}", style = MaterialTheme.typography.labelSmall)
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    if (item.identity in unread) UnreadDot()
+                                    Text(item.name, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    when {
+                                        privateMessages ->
+                                            Text(item.identity.substringAfterLast(':').take(12), style = MaterialTheme.typography.labelSmall)
+                                        installed == null && !item.identity.startsWith("slot:") ->
+                                            Text("Archiv · ${item.identity.take(8)}", style = MaterialTheme.typography.labelSmall)
+                                        installed != null && channels.count { it.channel.name == item.name } > 1 ->
+                                            Text("Slot ${installed.slot}", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                                Text(
+                                    last?.let { if (it.sender == null) it.text else "${it.sender}: ${it.text}" }
+                                        ?: "Noch keine Nachrichten",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                            if (menuOpen) {
+                                ChannelActionMenu(item, installed, onDismiss = { menuOpen = false }) { action ->
+                                    menuOpen = false
+                                    actionSession = liveManagement?.session
+                                    channelAction = action
                                 }
                             }
-                            Text(
-                                last?.let { if (it.sender == null) it.text else "${it.sender}: ${it.text}" }
-                                    ?: "Noch keine Nachrichten",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
                         }
                         HorizontalDivider()
                     }

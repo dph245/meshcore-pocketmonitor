@@ -3,6 +3,7 @@ package de.meshcore.pocketmonitor
 import de.meshcore.pocketmonitor.protocol.ChannelChange
 import de.meshcore.pocketmonitor.protocol.ChannelQuery
 import de.meshcore.pocketmonitor.protocol.NewChannel
+import de.meshcore.pocketmonitor.protocol.RadioChannel
 import de.meshcore.pocketmonitor.protocol.reference
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -62,6 +63,23 @@ class ChannelChangeTest {
         assertEquals(hex?.identity, base64?.identity)
         assertEquals(hex?.identity, NewChannel.parse("Raum", "ABEiM0RVZneImaq7zN3u/w")?.identity)
         assertNotNull(NewChannel.parse("#Test", ""))
+    }
+
+    @Test
+    fun restoringAnArchiveUsesItsExactNameAndKeyIdentity() {
+        val publicAlias = checkNotNull(NewChannel.restore("  Lokal ", RadioChannel.builtIn.identity))
+        assertEquals("  Lokal ", publicAlias.name)
+        assertEquals(RadioChannel.builtIn.identity, publicAlias.identity)
+        val hashtag = checkNotNull(NewChannel.parse("#Test", ""))
+        assertEquals(hashtag.identity, NewChannel.restore("#Test", hashtag.identity)?.identity)
+
+        val key = "00112233445566778899aabbccddeeff"
+        val custom = RadioChannel("#Test", key.hexToByteArray())
+        assertNull(NewChannel.restore(custom.name, custom.identity))
+        assertNull(NewChannel.restore(custom.name, custom.identity, "12".repeat(16)))
+        val restored = checkNotNull(NewChannel.restore(custom.name, custom.identity, key))
+        assertTrue(restored.change(2).matchesAfter(channelInfo(restored.change(2).command)))
+        assertEquals(custom.identity, restored.identity)
     }
 
     private fun channelInfo(command: ByteArray) =

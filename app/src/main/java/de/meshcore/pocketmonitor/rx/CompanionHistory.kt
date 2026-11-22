@@ -112,6 +112,35 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         }
     }
 
+    fun deleteArchivedChannel(companion: String, identity: String): Boolean {
+        if (identity.startsWith(PRIVATE_ID_PREFIX)) return false
+        val database = db
+        val args = arrayOf(companion, identity)
+        val deleted = database.inTransaction {
+            val archived = database.rawQuery(
+                "SELECT 1 FROM channel WHERE companion = ? AND identity = ? AND slot IS NULL", args,
+            ).use { it.moveToFirst() }
+            if (!archived) return@inTransaction false
+            val messages = "SELECT id FROM message WHERE companion = ? AND channel = ?"
+            // Preserve the original frames and exclude them from later channel backfills.
+            database.execSQL(
+                "UPDATE rx SET message_id = NULL, message_discarded = 1 WHERE message_id IN ($messages)",
+                args,
+            )
+            database.execSQL("""
+                UPDATE rx SET message_discarded = 1 WHERE id IN (
+                    SELECT rx_id FROM group_repeat WHERE send_id IN ($messages)
+                )
+            """, args)
+            database.delete("message", "companion = ? AND channel = ?", args)
+            database.delete("group_scope", "companion = ? AND channel = ?", args)
+            database.delete("channel", "companion = ? AND identity = ?", args)
+            true
+        }
+        if (deleted) changes.incrementAndGet()
+        return deleted
+    }
+
     fun beginGroup(companion: String, channel: HistoryChannel, text: String, now: Long, scope: String,
                    digest: (Long) -> String?): Pair<Long, Long> {
         val database = db
@@ -224,6 +253,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         db.rawQuery("""
             SELECT id, received_at, frame FROM rx
             WHERE companion = ? AND code = ${CompanionProtocol.RF_LOG} AND id > ? AND id <= ? AND message_id IS NULL
+                AND message_discarded = 0
                 AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)
             ORDER BY id LIMIT 128
         """, arrayOf(companion, after.toString(), through.toString())).use { it.collect(::readRx) }
@@ -451,7 +481,10 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     private fun link(database: SQLiteDatabase, companion: String, id: Long, message: DecodedMessage, unread: Boolean = true) {
         val payload = message.payload
         // A concurrent retention pass or decode may already have handled this reception.
-        val pending = database.rawQuery("SELECT 1 FROM rx WHERE id = ? AND companion = ? AND message_id IS NULL AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)",
+        val pending = database.rawQuery("""
+            SELECT 1 FROM rx WHERE id = ? AND companion = ? AND message_id IS NULL AND message_discarded = 0
+                AND NOT EXISTS (SELECT 1 FROM group_repeat WHERE rx_id = rx.id)
+        """,
             arrayOf(id.toString(), companion)).use { it.moveToFirst() }
         if (!pending) return
         val channel = HistoryChannel(payload.channelIdentity, payload.channel, null)

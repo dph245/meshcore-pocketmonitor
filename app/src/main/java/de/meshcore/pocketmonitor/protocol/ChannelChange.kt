@@ -24,10 +24,11 @@ internal class NewChannel private constructor(val name: String, private val key:
 
         fun validName(name: String): Boolean {
             val trimmed = name.trim()
-            if (trimmed.isEmpty() || trimmed == "#" || trimmed.any(Char::isISOControl)) return false
-            return runCatching { trimmed.encodeToByteArray(throwOnInvalidSequence = true).size in 1..31 }
-                .getOrDefault(false)
+            return trimmed != "#" && validStoredName(trimmed)
         }
+
+        fun validStoredName(name: String): Boolean = name.none(Char::isISOControl) &&
+            runCatching { name.encodeToByteArray(throwOnInvalidSequence = true).size in 1..31 }.getOrDefault(false)
 
         fun parse(name: String, secret: String): NewChannel? {
             if (!validName(name)) return null
@@ -39,6 +40,18 @@ internal class NewChannel private constructor(val name: String, private val key:
             }
             if (key.size != 16 || key.all { it == 0.toByte() }) return null
             return NewChannel(trimmed, key)
+        }
+
+        fun restore(name: String, identity: String, secret: String = ""): NewChannel? {
+            if (!validStoredName(name)) return null
+            val key = when {
+                secret.isNotBlank() -> decodeKey(secret.trim())
+                identity == RadioChannel.builtIn.identity -> RadioChannel.publicKeyBytes()
+                name.startsWith('#') -> FloodScope.namedKey(name)
+                else -> null
+            } ?: return null
+            if (key.size != 16 || key.all { it == 0.toByte() }) return null
+            return NewChannel(name, key).takeIf { it.identity == identity }
         }
 
         private fun decodeKey(secret: String): ByteArray? = runCatching {
