@@ -69,7 +69,7 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyPrivateAttemptMigration()
                 verifyArchiveDeletion()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, private RX and TX, group send, repeats, migration and paging\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration and paging\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -243,6 +243,20 @@ class HistoryInstrumentation : Instrumentation() {
                 history.appendQueued(other, "other-sync", Received(1, RxFrame(cutoff, pm)), slot, emptyMap())
                 check(history.channels(other, private = true).single().identity == "pm:prefix:$prefix")
                 check(history.messages(other, "pm:$contactKey", null).rows.isEmpty())
+                history.appendQueued(other, "other-sync", Received(2, RxFrame(cutoff, channel)), slot, emptyMap())
+                val unreadBefore = history.unreadConversations()
+                check(unreadBefore[id].orEmpty().containsAll(listOf(public.identity, "slot:5", "pm:prefix:$prefix")))
+                check(public.identity in unreadBefore[other].orEmpty())
+                val revision = history.revision
+                history.markAllChannelMessagesRead(id)
+                check(history.revision > revision)
+                check(history.unreadConversations() == unreadBefore +
+                    (id to unreadBefore.getValue(id).filter { it.startsWith("pm:") }.toSet()))
+                check(history.messages(id, public.identity, null).rows.single() == received.copy(unread = false))
+                check(history.messages(id, "slot:5", null).rows.single() == queueOnly.copy(unread = false))
+                val later = channel.copyOf(11) + "Neue Kanalnachricht".encodeToByteArray()
+                history.appendQueued(id, "later-sync", Received(2, RxFrame(cutoff, later)), slot, contacts)
+                check(history.messages(id, public.identity, null).rows.single { it.unread }.text == "Neue Kanalnachricht")
                 history.prune(now + 1)
                 check(history.channels(other, private = true).isEmpty())
                 check(history.messages(id, public.identity, null).rows.single().let {

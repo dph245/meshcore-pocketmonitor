@@ -331,6 +331,13 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         if (changed > 0) changes.incrementAndGet()
     }
 
+    fun markAllChannelMessagesRead(companion: String) {
+        val changed = db.update("message", ContentValues().apply { put("unread", 0) },
+            "companion = ? AND unread = 1 AND channel NOT LIKE '${PRIVATE_ID_PREFIX}%'",
+            arrayOf(companion))
+        if (changed > 0) changes.incrementAndGet()
+    }
+
     fun messages(
         companion: String, identity: String, before: MessageCursor?, limit: Int = CHAT_PAGE_SIZE,
         includeUnreadThrough: Boolean = false,

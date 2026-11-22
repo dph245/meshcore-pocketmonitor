@@ -7,6 +7,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -67,6 +69,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.Collator
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ChannelView(
     model: MonitorViewModel,
@@ -85,6 +88,9 @@ internal fun ChannelView(
     val conversationState = key(companion) { rememberSaveableStateHolder() }
     var previews by remember(companion) { mutableStateOf<List<ChannelPreview>?>(null) }
     var error by remember(companion) { mutableStateOf<String?>(null) }
+    var markReadError by remember(companion) { mutableStateOf<String?>(null) }
+    var markingRead by remember(companion) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(model, lifecycle, companion, selectedIdentity) {
         if (companion == null) return@LaunchedEffect
@@ -165,8 +171,31 @@ internal fun ChannelView(
     }
     BackHandler(enabled = channel != null, onBack = closeConversation)
     Column(modifier) {
-        if (channel == null && liveManagement != null) {
-            TextButton(onClick = { managementSession = liveManagement.session }) { Text("Kanäle verwalten") }
+        if (!privateMessages && companion != null && channel == null) {
+            val hasUnreadChannels = unread.any { !it.startsWith(PRIVATE_ID_PREFIX) }
+            if (liveManagement != null || channels.isNotEmpty() || hasUnreadChannels) {
+                FlowRow {
+                    if (liveManagement != null) {
+                        TextButton(onClick = { managementSession = liveManagement.session }) { Text("Kanäle verwalten") }
+                    }
+                    TextButton(enabled = hasUnreadChannels && !markingRead, onClick = {
+                        markingRead = true
+                        markReadError = null
+                        scope.launch {
+                            try {
+                                model.markAllChannelMessagesRead(companion)
+                            } catch (_: SQLiteException) {
+                                markReadError = "Kanalnachrichten konnten nicht als gelesen markiert werden."
+                            } finally {
+                                markingRead = false
+                            }
+                        }
+                    }) { Text("Alle als gelesen markieren") }
+                }
+            }
+            markReadError?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
         }
         (error ?: connectionError)?.let {
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)

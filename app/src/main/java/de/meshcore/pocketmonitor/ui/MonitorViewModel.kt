@@ -233,6 +233,9 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     suspend fun markMessagesRead(companion: String, channel: String, ids: List<Long>) =
         withContext(Dispatchers.IO) { history.markRead(companion, channel, ids) }
 
+    suspend fun markAllChannelMessagesRead(companion: String) =
+        withContext(Dispatchers.IO) { history.markAllChannelMessagesRead(companion) }
+
     fun historyChannels(companion: String, private: Boolean) = history.channels(companion, private = private)
 
     suspend fun deleteArchivedChannel(companion: String, identity: String) =
