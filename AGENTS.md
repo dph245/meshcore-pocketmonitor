@@ -13,3 +13,7 @@ Prüfe diese Datei nach jedem Sprint. Ergänze nur überprüfte Erkenntnisse, di
 ## Datenbanktests
 
 - SQLite-Historie, Migration und Paging prüft der eigene Android-Instrumentierungsrunner `HistoryInstrumentation`. `:app:assembleDebugAndroidTest` baut das Test-APK. Zum Ausführen nach Installation beider Debug-APKs `adb shell am instrument -w de.meshcore.pocketmonitor.test/de.meshcore.pocketmonitor.HistoryInstrumentation` nutzen und auf `PASS` in der Ausgabe prüfen.
+
+## Release auf dem Testgerät
+
+- `:app:assembleRelease` erzeugt `app-release-unsigned.apk`. Für Updates der bestehenden Testinstallation mit dem lokalen Android-Debugschlüssel signieren und das Zertifikat vorab mit der installierten APK abgleichen. Mit `adb install --no-streaming -r` aktualisieren, anschließend APK-Prüfsumme und Start der `MainActivity` auf dem Gerät prüfen.
