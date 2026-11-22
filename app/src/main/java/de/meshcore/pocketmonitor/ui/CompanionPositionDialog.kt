@@ -11,19 +11,23 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -32,6 +36,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import de.meshcore.pocketmonitor.protocol.CompanionPosition
@@ -91,25 +97,50 @@ internal fun CompanionPositionDialog(
         }
     }
 
-    AlertDialog(
-        onDismissRequest = {
-            if (pickingOnMap) pickingOnMap = false else if (!saving) onDismiss()
-        },
-        title = { Text(if (pickingOnMap) "Position auf der Karte" else "GPS-Position") },
-        text = {
-            val scroll = key(pickingOnMap) { rememberScrollState() }
-            Column(Modifier.verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (pickingOnMap) {
+    if (pickingOnMap) {
+        Dialog(
+            onDismissRequest = { pickingOnMap = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp),
+                shape = MaterialTheme.shapes.large,
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Position auf der Karte", style = MaterialTheme.typography.titleLarge)
                     Text("Tippe auf die Karte, um den Marker zu setzen.")
-                    PositionMapPicker(position?.takeUnless { it == CompanionPosition.ZERO }, pickedPosition) {
+                    PositionMapPicker(
+                        initialPosition = position?.takeUnless { it == CompanionPosition.ZERO },
+                        selected = pickedPosition,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                    ) {
                         pickedLatitude = it.latitudeE6
                         pickedLongitude = it.longitudeE6
                     }
                     pickedPosition?.let {
                         Text("${coordinateText(it.latitudeE6)} / ${coordinateText(it.longitudeE6)}")
                     }
-                    return@Column
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { pickingOnMap = false }) { Text("Zurück") }
+                        TextButton(
+                            onClick = {
+                                pickedPosition?.let(::fill)
+                                pickingOnMap = false
+                            },
+                            enabled = pickedPosition != null,
+                        ) { Text("Übernehmen") }
+                    }
                 }
+            }
+        }
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!saving) onDismiss() },
+        title = { Text("GPS-Position") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val focusManager = LocalFocusManager.current
                 OutlinedTextField(
                     value = latitude,
@@ -161,16 +192,6 @@ internal fun CompanionPositionDialog(
             }
         },
         confirmButton = {
-            if (pickingOnMap) {
-                TextButton(
-                    onClick = {
-                        pickedPosition?.let(::fill)
-                        pickingOnMap = false
-                    },
-                    enabled = pickedPosition != null,
-                ) { Text("Übernehmen") }
-                return@AlertDialog
-            }
             TextButton(
                 enabled = enabled && editable && position != null,
                 onClick = {
@@ -188,8 +209,7 @@ internal fun CompanionPositionDialog(
             ) { Text("Speichern") }
         },
         dismissButton = {
-            if (pickingOnMap) TextButton(onClick = { pickingOnMap = false }) { Text("Zurück") }
-            else TextButton(onClick = onDismiss, enabled = !saving) { Text("Abbrechen") }
+            TextButton(onClick = onDismiss, enabled = !saving) { Text("Abbrechen") }
         },
     )
 }

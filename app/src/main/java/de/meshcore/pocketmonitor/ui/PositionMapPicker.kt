@@ -11,8 +11,6 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.MaterialTheme
@@ -65,6 +63,7 @@ import kotlinx.coroutines.withContext
 internal fun PositionMapPicker(
     initialPosition: CompanionPosition?,
     selected: CompanionPosition?,
+    modifier: Modifier,
     onSelect: (CompanionPosition) -> Unit,
 ) {
     val context = LocalContext.current.applicationContext
@@ -96,7 +95,7 @@ internal fun PositionMapPicker(
     val select by rememberUpdatedState(onSelect)
 
     Box(
-        Modifier.fillMaxWidth().height(240.dp).clip(MaterialTheme.shapes.medium)
+        modifier.clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceVariant),
     ) {
         Canvas(
