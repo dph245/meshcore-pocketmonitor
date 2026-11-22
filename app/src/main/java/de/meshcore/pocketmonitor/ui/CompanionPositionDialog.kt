@@ -23,12 +23,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
@@ -49,10 +51,14 @@ internal fun CompanionPositionDialog(
     val context = LocalContext.current
     var latitude by rememberSaveable { mutableStateOf(current?.let { coordinateText(it.latitudeE6) }.orEmpty()) }
     var longitude by rememberSaveable { mutableStateOf(current?.let { coordinateText(it.longitudeE6) }.orEmpty()) }
+    var pickingOnMap by rememberSaveable { mutableStateOf(false) }
+    var pickedLatitude by rememberSaveable { mutableStateOf<Int?>(null) }
+    var pickedLongitude by rememberSaveable { mutableStateOf<Int?>(null) }
     var readingGps by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val position = CompanionPosition.parse(latitude, longitude)
+    val pickedPosition = pickedLatitude?.let { lat -> pickedLongitude?.let { CompanionPosition(lat, it) } }
     val editable = !saving && !readingGps
     fun fill(value: CompanionPosition) {
         latitude = coordinateText(value.latitudeE6)
@@ -86,10 +92,25 @@ internal fun CompanionPositionDialog(
     }
 
     AlertDialog(
-        onDismissRequest = { if (!saving) onDismiss() },
-        title = { Text("GPS-Position") },
+        onDismissRequest = {
+            if (pickingOnMap) pickingOnMap = false else if (!saving) onDismiss()
+        },
+        title = { Text(if (pickingOnMap) "Position auf der Karte" else "GPS-Position") },
         text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val scroll = key(pickingOnMap) { rememberScrollState() }
+            Column(Modifier.verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (pickingOnMap) {
+                    Text("Tippe auf die Karte, um den Marker zu setzen.")
+                    PositionMapPicker(position?.takeUnless { it == CompanionPosition.ZERO }, pickedPosition) {
+                        pickedLatitude = it.latitudeE6
+                        pickedLongitude = it.longitudeE6
+                    }
+                    pickedPosition?.let {
+                        Text("${coordinateText(it.latitudeE6)} / ${coordinateText(it.longitudeE6)}")
+                    }
+                    return@Column
+                }
+                val focusManager = LocalFocusManager.current
                 OutlinedTextField(
                     value = latitude,
                     onValueChange = { latitude = it; error = null },
@@ -108,6 +129,16 @@ internal fun CompanionPositionDialog(
                     keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
                     modifier = Modifier.fillMaxWidth(),
                 )
+                TextButton(
+                    onClick = {
+                        focusManager.clearFocus()
+                        val initial = position?.takeUnless { it == CompanionPosition.ZERO }
+                        pickedLatitude = initial?.latitudeE6
+                        pickedLongitude = initial?.longitudeE6
+                        pickingOnMap = true
+                    },
+                    enabled = editable,
+                ) { Text("Auf Karte auswählen") }
                 TextButton(
                     onClick = {
                         error = null
@@ -130,6 +161,16 @@ internal fun CompanionPositionDialog(
             }
         },
         confirmButton = {
+            if (pickingOnMap) {
+                TextButton(
+                    onClick = {
+                        pickedPosition?.let(::fill)
+                        pickingOnMap = false
+                    },
+                    enabled = pickedPosition != null,
+                ) { Text("Übernehmen") }
+                return@AlertDialog
+            }
             TextButton(
                 enabled = enabled && editable && position != null,
                 onClick = {
@@ -146,7 +187,10 @@ internal fun CompanionPositionDialog(
                 },
             ) { Text("Speichern") }
         },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !saving) { Text("Abbrechen") } },
+        dismissButton = {
+            if (pickingOnMap) TextButton(onClick = { pickingOnMap = false }) { Text("Zurück") }
+            else TextButton(onClick = onDismiss, enabled = !saving) { Text("Abbrechen") }
+        },
     )
 }
 
