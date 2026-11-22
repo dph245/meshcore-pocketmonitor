@@ -97,6 +97,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun groupRepeats(id: Long) = history.groupRepeats(id)
 
+    fun groupReceptionPaths(companion: String, messageId: Long) = history.groupReceptionPaths(companion, messageId)
+
     fun groupRepeaterNames(companion: String) = history.groupRepeaterNames(companion)
 
     fun sendGroup(session: String, companion: String, channel: String, text: String, scope: String,

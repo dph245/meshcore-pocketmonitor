@@ -321,6 +321,7 @@ private fun PagedConversation(
     var sendError by remember { mutableStateOf<String?>(null) }
     var submitting by remember { mutableStateOf(false) }
     var detailId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var receptionPathId by rememberSaveable { mutableStateOf<Long?>(null) }
     if (!privateMessages) {
         LaunchedEffect(model, companion, channel.identity) {
             if (scope == null) {
@@ -340,6 +341,9 @@ private fun PagedConversation(
                 sendError = null
                 detailId = null
             })
+        }
+        page?.rows?.find { it.sequence == receptionPathId }?.let { message ->
+            ReceptionPathDialog(model, companion, message, onDismiss = { receptionPathId = null })
         }
     }
     val unreadThrough = page?.unreadThrough
@@ -375,6 +379,7 @@ private fun PagedConversation(
                 draft = "@[$nickname] $draft"
                 sendError = null
             },
+            onReceptionPath = if (privateMessages) null else { id -> receptionPathId = id },
             onOutgoingDetails = { detailId = it }, onReusePrivate = { message ->
                 draft = message.text
                 sendError = null
@@ -463,6 +468,7 @@ internal fun ChannelConversation(
     onReusePrivate: ((ChannelMessage) -> Unit)? = null,
     onReply: ((String) -> Unit)? = null,
     header: (@Composable () -> Unit)? = null,
+    onReceptionPath: ((Long) -> Unit)? = null,
 ) {
     var displayed by remember { mutableStateOf(messages, referentialEqualityPolicy()) }
     var pendingLatest by remember { mutableStateOf<Long?>(null) }
@@ -571,7 +577,7 @@ internal fun ChannelConversation(
                     val announcement = remember(message) {
                         AnnotatedString("${message.senderLabel}\n$metadata\n${message.text}")
                     }
-                    MessageActions(bubble, message, onReply) {
+                    MessageActions(bubble, message, onReply, onReceptionPath = onReceptionPath) {
                         Column(bubblePadding.clearAndSetSemantics { text = announcement }) {
                             ListRowText(message.senderLabel, senderStyle)
                             ListRowText(metadata, timeStyle)
@@ -590,6 +596,7 @@ private fun MessageActions(
     message: ChannelMessage,
     onReply: ((String) -> Unit)?,
     onDetails: ((Long) -> Unit)? = null,
+    onReceptionPath: ((Long) -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     val clipboard = LocalClipboard.current
@@ -617,6 +624,12 @@ private fun MessageActions(
                     DropdownMenuItem(text = { Text("Sendedetails") }, onClick = {
                         expanded = false
                         onDetails(message.sequence)
+                    })
+                }
+                if (onReceptionPath != null && message.receptionCount > 0) {
+                    DropdownMenuItem(text = { Text("Empfangspfad") }, onClick = {
+                        expanded = false
+                        onReceptionPath(message.sequence)
                     })
                 }
             }

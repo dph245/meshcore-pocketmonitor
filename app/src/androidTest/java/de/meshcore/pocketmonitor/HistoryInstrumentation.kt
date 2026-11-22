@@ -83,7 +83,7 @@ class HistoryInstrumentation : Instrumentation() {
     private suspend fun verifyWriteAndPaging(history: CompanionHistory) {
         val writer = ReceptionWriter(history, onIdentified = {}, onError = { error(it) })
         val cutoff = now - HISTORY_AGE_MS
-        val forwarding = "8800b015012a".hexToByteArray() + publicFrame.copyOfRange(5, publicFrame.size)
+        val forwarding = "8800b015422a2bb2a1".hexToByteArray() + publicFrame.copyOfRange(5, publicFrame.size)
         check(writer.offer(RxFrame(cutoff - 1, publicFrame)))
         check(writer.identify(KnownCompanion(id, "Gleicher Name")))
         check(writer.offer(RxFrame(cutoff, forwarding)))
@@ -98,7 +98,11 @@ class HistoryInstrumentation : Instrumentation() {
         val samples = listOf(Received(1, RxFrame(now, publicFrame)))
         repeat(2) { history.append(other, "other", samples, ChannelDecoding.default) }
         check(history.messages(other, public.identity, null).rows.single().receptionCount == 1L)
-        check(history.messages(id, public.identity, null).rows.single().receptionCount == 2L)
+        val received = history.messages(id, public.identity, null).rows.single()
+        check(received.receptionCount == 2L)
+        check(history.groupReceptionPaths(id, received.sequence) ==
+            mapOf(emptyList<String>() to 1, listOf("2A2B", "B2A1") to 1))
+        check(history.groupReceptionPaths(other, received.sequence).isEmpty())
         check(history.messages(other, private.identity, null).rows.isEmpty())
         val journal = history.journal(id, null, null, null)
         check(journal.count == 3L)
@@ -229,7 +233,11 @@ class HistoryInstrumentation : Instrumentation() {
                 check(history.channels(id, private = true).map { it.identity }.toSet() ==
                     setOf("pm:$contactKey", "pm:prefix:$prefix", "pm:prefix:12CDEF012345"))
                 check(history.channels(id).map { it.identity }.toSet() == setOf(public.identity, "slot:5"))
-                check(history.messages(id, public.identity, null).rows.single().receptionCount == 2L)
+                val received = history.messages(id, public.identity, null).rows.single()
+                check(received.receptionCount == 2L)
+                check(history.groupReceptionPaths(id, received.sequence) == mapOf(emptyList<String>() to 2))
+                val queueOnly = history.messages(id, "slot:5", null).rows.single()
+                check(history.groupReceptionPaths(id, queueOnly.sequence).isEmpty())
                 history.register(other, "Companion", now)
                 history.appendQueued(other, "other-sync", Received(1, RxFrame(cutoff, pm)), slot, emptyMap())
                 check(history.channels(other, private = true).single().identity == "pm:prefix:$prefix")
@@ -239,6 +247,7 @@ class HistoryInstrumentation : Instrumentation() {
                 check(history.messages(id, public.identity, null).rows.single().let {
                     it.receptionCount == 1L && it.synchronized
                 })
+                check(history.groupReceptionPaths(id, received.sequence) == mapOf(emptyList<String>() to 1))
                 history.prune(now + HISTORY_AGE_MS + 1)
                 check(history.channels(id, private = true).isEmpty() && history.channels(id).isEmpty())
             }

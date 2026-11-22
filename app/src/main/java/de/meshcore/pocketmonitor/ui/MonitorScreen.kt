@@ -51,8 +51,10 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -240,9 +242,13 @@ internal fun MonitorScreen(
                         ),
                         Modifier.align(Alignment.CenterHorizontally),
                     )
-                    if (connection.syncingMessages) {
-                        Text("Nachrichten werden abgeglichen …", style = MaterialTheme.typography.bodySmall)
-                    }
+                    val syncStatusVisibility = if (connection.syncingMessages) Modifier
+                        else Modifier.alpha(0f).clearAndSetSemantics { }
+                    Text(
+                        "Nachrichten werden abgeglichen …",
+                        modifier = syncStatusVisibility,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     connection.messageSyncError?.let {
                         Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                     }

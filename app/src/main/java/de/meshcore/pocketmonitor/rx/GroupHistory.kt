@@ -11,6 +11,7 @@ import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.MeshHeader
 import de.meshcore.pocketmonitor.protocol.MeshPacketDecoder
 import de.meshcore.pocketmonitor.protocol.PacketType
+import de.meshcore.pocketmonitor.ui.decodeRadioRow
 import java.util.UUID
 
 internal data class OutgoingGroup(
@@ -60,6 +61,24 @@ internal class GroupHistory(private val db: SQLiteDatabase) {
     fun scope(companion: String, channel: String): String? =
         db.rawQuery("SELECT scope FROM group_scope WHERE companion = ? AND channel = ?", arrayOf(companion, channel))
             .use { if (it.moveToFirst()) it.getString(0) else null }
+
+    fun receptionPaths(companion: String, messageId: Long): Map<List<String>, Int> = db.rawQuery("""
+        SELECT id, received_at, frame FROM rx
+        WHERE companion = ? AND message_id = ? AND code = ${CompanionProtocol.RF_LOG}
+        ORDER BY id
+    """, arrayOf(companion, messageId.toString())).use { cursor ->
+        buildMap {
+            while (cursor.moveToNext()) {
+                val row = RxRow(cursor.getLong(0), RxFrame(cursor.getLong(1), cursor.getBlob(2)))
+                val packet = decodeRadioRow(row, noKeys).packet ?: continue
+                val header = packet.header ?: continue
+                // DIRECT headers carry the remaining route. Only FLOOD records traversed hops.
+                if (header.type != PacketType.GRP_TXT || header.route.isDirect) continue
+                val prefixes = packet.path?.prefixes ?: continue
+                put(prefixes, getOrDefault(prefixes, 0) + 1)
+            }
+        }
+    }
 
     fun repeats(id: Long): List<GroupRepeat> = db.rawQuery("""
         SELECT prefix, rx.id, received_at, frame FROM group_repeat JOIN rx ON rx.id = rx_id

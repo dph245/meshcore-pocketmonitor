@@ -177,6 +177,8 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
 
     fun groupRepeats(id: Long) = GroupHistory(db).repeats(id)
 
+    fun groupReceptionPaths(companion: String, messageId: Long) = GroupHistory(db).receptionPaths(companion, messageId)
+
     fun saveGroupRepeaters(companion: String, contacts: List<CompanionContact>) =
         GroupHistory(db).saveRepeaters(companion, contacts)
 
