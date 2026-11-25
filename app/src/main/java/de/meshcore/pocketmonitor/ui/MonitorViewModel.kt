@@ -2,6 +2,7 @@ package de.meshcore.pocketmonitor.ui
 
 import android.app.Application
 import android.content.Context
+import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import de.meshcore.pocketmonitor.CompanionReceiveService
 import de.meshcore.pocketmonitor.PocketMonitorApplication
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
@@ -58,6 +59,12 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     private val mutableScan = MutableStateFlow(ScanState())
     val scan = mutableScan.asStateFlow()
     val connectionStatus = connection.status
+    private val tcpPreferences = application.getSharedPreferences("tcp_connection", Context.MODE_PRIVATE)
+    val tcpHost get() = tcpPreferences.getString("host", "").orEmpty()
+    val tcpPort get() = tcpPreferences.getInt("port", TcpEndpoint.DEFAULT_PORT)
+    val tcpAutoReconnect = connection.tcpAutoReconnect
+    private val mutableTcpError = MutableStateFlow<String?>(null)
+    val tcpError = mutableTcpError.asStateFlow()
     val discover = connection.discover
     val traces = connection.traces
     val groupSender = connection.groupSender
@@ -202,6 +209,28 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
             false
         }
     }
+
+    fun connectTcp(endpoint: TcpEndpoint): Boolean {
+        if (!historyReady.value || connectionStatus.value.active) return false
+        stopScan()
+        mutableTcpError.value = null
+        tcpPreferences.edit {
+            putString("host", endpoint.host)
+            putInt("port", endpoint.port)
+        }
+        return try {
+            CompanionReceiveService.start(getApplication(), endpoint)
+            true
+        } catch (_: SecurityException) {
+            mutableTcpError.value = "TCP-Hintergrundempfang ist nicht erlaubt."
+            false
+        } catch (_: IllegalStateException) {
+            mutableTcpError.value = "TCP-Hintergrundempfang konnte nicht gestartet werden."
+            false
+        }
+    }
+
+    fun setTcpAutoReconnect(enabled: Boolean) = connection.setTcpAutoReconnect(enabled)
 
     fun disconnect() = CompanionReceiveService.stop(getApplication())
 

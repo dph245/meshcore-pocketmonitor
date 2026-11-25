@@ -69,6 +69,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import de.meshcore.pocketmonitor.R
 import de.meshcore.pocketmonitor.rx.PRIVATE_ID_PREFIX
+import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import android.database.sqlite.SQLiteException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -82,6 +83,7 @@ internal fun MonitorScreen(
     model: MonitorViewModel,
     onScan: () -> Unit,
     onConnect: () -> Unit,
+    onTcpConnect: (TcpEndpoint) -> Unit,
     openMessagesRequest: Int,
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
@@ -105,6 +107,12 @@ internal fun MonitorScreen(
             selectedTab = 2
             handledMessagesRequest = openMessagesRequest
         }
+    }
+    var useTcp by rememberSaveable { mutableStateOf(connection.tcp) }
+    // Follow the transport of a session that survived activity recreation.
+    val showTcp = if (connection.active) connection.tcp else useTcp
+    LaunchedEffect(connection.active, connection.tcp) {
+        if (connection.active) useTcp = connection.tcp
     }
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
@@ -164,17 +172,52 @@ internal fun MonitorScreen(
                             connection.message,
                             color = if (connection.error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(
-                                onClick = if (scan.scanning) model::stopScan else onScan,
+                        SecondaryTabRow(selectedTabIndex = if (showTcp) 1 else 0) {
+                            Tab(
+                                selected = !showTcp,
+                                onClick = { useTcp = false },
                                 enabled = !connection.active,
-                            ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
-                            Button(
-                                onClick = if (connection.active) model::disconnect else onConnect,
-                                enabled = connection.active || (historyReady && scan.selected != null),
-                            ) { Text(if (connection.active) "Trennen" else "Verbinden") }
+                                text = { Text("Bluetooth") },
+                                icon = { Icon(painterResource(R.drawable.ic_tab_bluetooth), null) },
+                            )
+                            Tab(
+                                selected = showTcp,
+                                onClick = { useTcp = true },
+                                enabled = !connection.active,
+                                text = { Text("TCP") },
+                                icon = { Icon(painterResource(R.drawable.ic_tab_network), null) },
+                            )
                         }
-                        DeviceMenu(scan, enabled = !connection.active, model = model)
+                        if (showTcp) {
+                            val autoReconnect by model.tcpAutoReconnect.collectAsStateWithLifecycle()
+                            val tcpError by model.tcpError.collectAsStateWithLifecycle()
+                            tabState.SaveableStateProvider("tcpConnection") {
+                                TcpConnectionForm(
+                                    savedHost = model.tcpHost,
+                                    savedPort = model.tcpPort,
+                                    active = connection.active,
+                                    ready = historyReady,
+                                    autoReconnect = autoReconnect,
+                                    onAutoReconnect = model::setTcpAutoReconnect,
+                                    onConnect = onTcpConnect,
+                                    onDisconnect = model::disconnect,
+                                )
+                            }
+                            tcpError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        } else {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = if (scan.scanning) model::stopScan else onScan,
+                                    enabled = !connection.active,
+                                ) { Text(if (scan.scanning) "Scan stoppen" else "Geräte suchen") }
+                                Button(
+                                    onClick = if (connection.active) model::disconnect else onConnect,
+                                    enabled = connection.active || (historyReady && scan.selected != null),
+                                ) { Text(if (connection.active) "Trennen" else "Verbinden") }
+                            }
+                            DeviceMenu(scan, enabled = !connection.active, model = model)
+                            scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        }
                         if (contacts.journalName != null) {
                             val voltage = connection.batteryMv?.let { String.format(Locale.GERMANY, "%.3f V", it / 1000.0) } ?: "—"
                             val noiseFloor = connection.noiseFloorDbm?.let { "$it dBm" } ?: "—"
@@ -185,7 +228,6 @@ internal fun MonitorScreen(
                         connection.management?.let { management ->
                             CompanionControls(management, contacts, model)
                         }
-                        scan.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         Row(
                             Modifier.fillMaxWidth()
                                 .toggleable(keepScreenOn, role = Role.Checkbox, onValueChange = onKeepScreenOnChange)

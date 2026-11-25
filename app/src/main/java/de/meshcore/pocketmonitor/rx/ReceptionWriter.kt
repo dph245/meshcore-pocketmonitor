@@ -34,7 +34,7 @@ internal class ReceptionWriter(
     private val queue = Channel<Event>(8192)
     private val session = UUID.randomUUID().toString()
 
-    // Drain accepted notifications on normal disconnect, independently of the GATT handler.
+    // Drain accepted notifications on normal disconnect, independently of the connection handler.
     internal val completion = CoroutineScope(Dispatchers.IO).launch {
         try {
             var companion: KnownCompanion? = null

@@ -44,14 +44,9 @@ class MainActivity : ComponentActivity() {
                 onScan = {
                     if (hasScanPermissions()) model.startScan() else requestScan.launch(scanPermissions())
                 },
-                onConnect = {
-                    if (model.connect() && Build.VERSION.SDK_INT >= 33 &&
-                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
-                        !preferences.getBoolean(ASKED_NOTIFICATIONS, false)
-                    ) {
-                        preferences.edit { putBoolean(ASKED_NOTIFICATIONS, true) }
-                        requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
-                    }
+                onConnect = { if (model.connect()) requestNotificationsIfNeeded() },
+                onTcpConnect = { endpoint ->
+                    if (model.connectTcp(endpoint)) requestNotificationsIfNeeded()
                 },
                 openMessagesRequest = openMessagesRequest,
                 keepScreenOn = keepScreenOn,
@@ -85,6 +80,17 @@ class MainActivity : ComponentActivity() {
         if (intent.action == CompanionReceiveService.OPEN_MESSAGES) {
             openMessagesRequest++
             intent.action = Intent.ACTION_MAIN
+        }
+    }
+
+    private fun requestNotificationsIfNeeded() {
+        val preferences = getPreferences(MODE_PRIVATE)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !preferences.getBoolean(ASKED_NOTIFICATIONS, false)
+        ) {
+            preferences.edit { putBoolean(ASKED_NOTIFICATIONS, true) }
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 

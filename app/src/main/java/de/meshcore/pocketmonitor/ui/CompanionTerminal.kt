@@ -183,7 +183,7 @@ internal fun CompanionTerminal(
                 !status.available -> "Companion erneut verbinden."
                 limit == null -> "Benötigt Companion-Protokollversion 14 oder höher."
                 status.busy && !terminal.waiting -> "Ein Companion-Vorgang läuft …"
-                command.isNotBlank() && !validInput() -> "Ungültiges Kommando oder BLE-Längenlimit überschritten."
+                command.isNotBlank() && !validInput() -> "Ungültiges Kommando oder Längenlimit überschritten."
                 else -> null
             }
             statusText?.let {
