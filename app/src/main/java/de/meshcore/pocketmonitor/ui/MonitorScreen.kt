@@ -46,6 +46,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -81,6 +82,8 @@ import java.util.Locale
 @Composable
 internal fun MonitorScreen(
     model: MonitorViewModel,
+    backupModel: BackupViewModel,
+    onAppRestored: suspend () -> Unit,
     onScan: () -> Unit,
     onConnect: () -> Unit,
     onTcpConnect: (TcpEndpoint) -> Unit,
@@ -97,8 +100,9 @@ internal fun MonitorScreen(
     val companion by model.selectedCompanion.collectAsStateWithLifecycle()
     val historyReady by model.historyReady.collectAsStateWithLifecycle()
     val historyError by model.historyError.collectAsStateWithLifecycle()
-    val tabState = rememberSaveableStateHolder()
-    val liveList = rememberLazyListState()
+    val restoreRevision by model.restoreRevision.collectAsStateWithLifecycle()
+    val tabState = key(restoreRevision) { rememberSaveableStateHolder() }
+    val liveList = key(restoreRevision) { rememberLazyListState() }
     val liveState = remember(liveList) { LiveViewState(liveList) }
     var selectedTab by rememberSaveable { mutableIntStateOf(3) }
     var handledMessagesRequest by remember { mutableIntStateOf(0) }
@@ -114,6 +118,7 @@ internal fun MonitorScreen(
     LaunchedEffect(connection.active, connection.tcp) {
         if (connection.active) useTcp = connection.tcp
     }
+    var backupOpen by rememberSaveable { mutableStateOf(false) }
     var liveTab by rememberSaveable { mutableIntStateOf(0) }
     var messageTab by rememberSaveable { mutableIntStateOf(0) }
     var discoverTab by rememberSaveable { mutableIntStateOf(0) }
@@ -141,6 +146,9 @@ internal fun MonitorScreen(
     val unreadHere = unread[companion].orEmpty()
     val editingMessage = selectedTab == 2 && WindowInsets.isImeVisible
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+        if (backupOpen) {
+            BackupDialog(backupModel, connection, historyReady, onAppRestored) { backupOpen = false }
+        }
         Scaffold { insets ->
             Column(
                 Modifier.fillMaxSize()
@@ -157,7 +165,7 @@ internal fun MonitorScreen(
                             MonitorTab("Live-Funk", R.drawable.ic_tab_radio),
                             MonitorTab("DISCOVER", R.drawable.ic_tab_discover),
                             MonitorTab("Nachrichten", R.drawable.ic_tab_messages, unreadHere.isNotEmpty()),
-                            MonitorTab("Verbindung", R.drawable.ic_tab_bluetooth),
+                            MonitorTab("Verbindung", R.drawable.ic_tab_settings),
                         ),
                         Modifier.align(Alignment.CenterHorizontally),
                     )
@@ -224,6 +232,9 @@ internal fun MonitorScreen(
                             Text("Akku $voltage · Noise Floor $noiseFloor", style = MaterialTheme.typography.bodySmall)
                             val uptime = connection.uptimeSeconds?.let(::formatUptime) ?: "—"
                             Text("Uptime $uptime", style = MaterialTheme.typography.bodySmall)
+                        }
+                        OutlinedButton(onClick = { backupOpen = true }) {
+                            Text("Backup und Wiederherstellung")
                         }
                         connection.management?.let { management ->
                             CompanionControls(management, contacts, model)

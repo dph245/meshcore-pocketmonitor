@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import de.meshcore.pocketmonitor.protocol.CompanionContact
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 9) {
+    SQLiteOpenHelper(context, name, null, 10) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -68,6 +68,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         indexIncomingMessages(db)
         createContactTypes(db)
         db.execSQL("CREATE TABLE legacy_import (session TEXT PRIMARY KEY NOT NULL, ordinal INTEGER NOT NULL)")
+        createBackupState(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -89,6 +90,11 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         }
         if (oldVersion < 8) addPrivateSendProgress(db)
         if (oldVersion < 9) db.execSQL("ALTER TABLE rx ADD COLUMN message_discarded INTEGER NOT NULL DEFAULT 0")
+        if (oldVersion < 10) createBackupState(db)
+    }
+
+    private fun createBackupState(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE backup_state (restore_id TEXT PRIMARY KEY NOT NULL)")
     }
 
     private fun createContactTypes(db: SQLiteDatabase) {

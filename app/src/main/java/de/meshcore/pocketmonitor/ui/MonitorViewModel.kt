@@ -56,6 +56,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val historyError = mutableHistoryError.asStateFlow()
     private val mutableHistoryReady = MutableStateFlow(false)
     val historyReady = mutableHistoryReady.asStateFlow()
+    private val mutableRestoreRevision = MutableStateFlow(0)
+    val restoreRevision = mutableRestoreRevision.asStateFlow()
     private val mutableScan = MutableStateFlow(ScanState())
     val scan = mutableScan.asStateFlow()
     val connectionStatus = connection.status
@@ -159,6 +161,15 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
                 }
             }
         }
+    }
+
+    suspend fun refreshRestoredHistory() {
+        val known = withContext(Dispatchers.IO) { history.knownCompanions() }
+        mutableCompanions.value = known
+        mutableSelectedCompanion.value = known.firstOrNull()?.id
+        mutableHistoryError.value = null
+        mutablePrivateOptionsRevision.value++
+        mutableRestoreRevision.value++
     }
 
     fun selectHistory(id: String) {

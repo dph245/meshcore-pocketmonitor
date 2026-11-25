@@ -42,6 +42,12 @@ PocketMonitor ist eine native Android-App für MeshCore-Companions. Sie verbinde
 - Die Sammelaktion markiert alle ungelesenen Kanalnachrichten der ausgewählten Companion-Historie in einem SQLite-Update. Sie erfasst auch archivierte Kanäle und unbekannte Slots. Der Filter überspringt Privatnachrichten anhand von `PRIVATE_ID_PREFIX` (`pm:`).
 - Beim Löschen eines archivierten Kanals bleiben die RX-Rohframes erhalten. `rx.message_discarded` verhindert, dass eine spätere Nachdecodierung den gelöschten Verlauf aus diesen Frames wiederherstellt. Das Entfernen vom Companion belässt den Verlauf im Archiv.
 
+## Manuelle Sicherungen
+
+- `AppBackup` schreibt App-Historie und Einstellungen oder das Companion-Setup als getrennte, passwortgeschützte `.pmbackup`-Dateien über die Android-Dateiauswahl. Der SQLite-Snapshot enthält den sichtbaren WAL-Stand. Beim Kopieren berechnet der RX-Trigger `rx_count`. Ändert sich das Schema, Tabellenliste und Restore-Test in `HistoryBackup` beziehungsweise `HistoryInstrumentation` mitpflegen.
+- App-Restore setzt eine getrennte Companion-Sitzung voraus und wartet auf den Journal-Writer. Die SQLite-Markierung entscheidet nach einem Prozessabbruch, welche Einstellungen aus der privaten Wiederherstellungsdatei angewendet werden. Android-Systembackup und Gerätetransfer bleiben ausgeschlossen.
+- Companion-Setup läuft exklusiv über dieselbe BLE-/TCP-Sitzung. Ein Identitätsimport ist optional, firmwareabhängig und wird über den vollständigen Public Key verifiziert. Private Schlüssel bleiben aus dem Journal. Die Sitzung endet nach dem Restore. Kontakte werden anhand des vollständigen Schlüssels übernommen und zusätzliche Zielkontakte bleiben erhalten.
+
 ## Builds und lokale Prüfungen
 
 Setze den SDK-Pfad über die lokale Entwicklungsumgebung oder `local.properties`. Der Wrapper lädt seine Abhängigkeiten beim ersten Build. Mit vorhandenem Cache kann `--offline` genutzt werden.

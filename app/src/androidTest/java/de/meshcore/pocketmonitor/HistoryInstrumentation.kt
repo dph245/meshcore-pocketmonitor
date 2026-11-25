@@ -2,6 +2,14 @@ package de.meshcore.pocketmonitor
 
 import android.app.Activity
 import android.app.Instrumentation
+import android.content.Context
+import android.content.ContextWrapper
+import android.net.Uri
+import de.meshcore.pocketmonitor.backup.AppBackup
+import de.meshcore.pocketmonitor.backup.BackupContents
+import de.meshcore.pocketmonitor.backup.CompanionSetup
+import de.meshcore.pocketmonitor.ble.CompanionConnection
+import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import android.os.Bundle
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
@@ -27,9 +35,17 @@ import de.meshcore.pocketmonitor.rx.Received
 import de.meshcore.pocketmonitor.rx.ReceptionWriter
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.decodeMessage
+import java.io.DataInputStream
 import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import kotlinx.coroutines.withTimeout
 
 class HistoryInstrumentation : Instrumentation() {
@@ -68,8 +84,10 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyPrivateSend()
                 verifyPrivateAttemptMigration()
                 verifyArchiveDeletion()
+                verifyBackupRoundTrip(legacy)
+                verifyCompanionRestoreOverTcp()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration and paging\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging encrypted backup restore and simulated TCP setup\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -79,6 +97,179 @@ class HistoryInstrumentation : Instrumentation() {
             legacy.deleteRecursively()
         }
         finish(code, result)
+    }
+
+    private fun verifyBackupRoundTrip(directory: File) {
+        val prefix = "backup-test-${UUID.randomUUID()}"
+        val prefs = mutableSetOf<String>()
+        val context = object : ContextWrapper(targetContext) {
+            override fun getCacheDir() = directory
+            override fun getNoBackupFilesDir() = directory
+            override fun getSharedPreferences(name: String, mode: Int) =
+                super.getSharedPreferences("$prefix-$name".also(prefs::add), mode)
+        }
+        val databaseName = "$prefix.db"
+        try {
+            HistoryDatabase(context, databaseName).use { helper ->
+                val history = CompanionHistory(helper)
+                val backup = AppBackup(context, history)
+                val export = File(directory, "backup.pmbackup")
+                val password = "synthetisches-testpasswort".toCharArray()
+                val conversation = context.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
+                val routes = context.getSharedPreferences("installed_private_routes", Context.MODE_PRIVATE)
+                check(conversation.edit().putString("channel_order", "RECENT").commit())
+                check(routes.edit().putStringSet("synthetic-route", setOf("test-hop")).commit())
+                history.register(id, "Gesichert", now)
+                history.append(id, "test", listOf(Received(1, RxFrame(now, publicFrame))), ChannelDecoding.default)
+                val original = history.messages(id, public.identity, null).rows.single()
+                val unread = history.unreadConversations()
+                check(unread.isNotEmpty())
+                backup.writeApp(Uri.fromFile(export), password)
+
+                history.register(other, "Später", now)
+                history.markAllChannelMessagesRead(id)
+                check(conversation.edit().putString("channel_order", "ALPHABETICAL").commit())
+                check(routes.edit().clear().commit())
+                val preview = backup.read(Uri.fromFile(export), password) as BackupContents.App
+                preview.use {
+                    check(history.knownCompanions().size == 2)
+                    backup.restoreApp(it)
+                }
+                check(history.knownCompanions() == listOf(KnownCompanion(id, "Gesichert")))
+                check(history.unreadConversations() == unread)
+                check(history.messages(id, public.identity, null).rows.single() == original)
+                check(history.journal(id, null, null, null).let {
+                    it.count == 1L && it.newestFirst.single().frame.bytes.contentEquals(publicFrame)
+                })
+                check(conversation.getString("channel_order", null) == "RECENT")
+                check(routes.getStringSet("synthetic-route", null) == setOf("test-hop"))
+
+                // Emulate a process ending after the preferences changed but before SQLite committed.
+                val rollback = JSONObject()
+                val committed = JSONObject()
+                for (file in listOf("MainActivity", "conversation_preferences", "live_preferences", "tcp_connection", "installed_private_routes")) {
+                    rollback.put(file, JSONObject())
+                    committed.put(file, JSONObject())
+                }
+                rollback.getJSONObject("conversation_preferences").put("channel_order", "RECENT")
+                committed.getJSONObject("conversation_preferences").put("channel_order", "ALPHABETICAL")
+                val pending = File(directory, "manual-restore.json")
+                fun interruptRestore(id: String) {
+                    pending.writeText(JSONObject().put("id", id).put("old", rollback).put("new", committed).toString())
+                    backup.recoverInterruptedRestore()
+                    check(!pending.exists())
+                }
+                check(conversation.edit().putString("channel_order", "ALPHABETICAL").commit())
+                interruptRestore("uncommitted-test")
+                check(conversation.getString("channel_order", null) == "RECENT")
+                val committedId = helper.writableDatabase.rawQuery("SELECT restore_id FROM backup_state", null).use {
+                    check(it.moveToFirst())
+                    it.getString(0)
+                }
+                interruptRestore(committedId)
+                check(conversation.getString("channel_order", null) == "ALPHABETICAL")
+            }
+        } finally {
+            context.deleteDatabase(databaseName)
+            prefs.forEach(targetContext::deleteSharedPreferences)
+        }
+    }
+
+    private suspend fun verifyCompanionRestoreOverTcp() = coroutineScope {
+        val name = "setup-test-${UUID.randomUUID()}.db"
+        val oldKey = 0x3a.toByte()
+        val newKey = 0x4b.toByte()
+        val oldId = ByteArray(32) { oldKey }.toHexString()
+        val newId = ByteArray(32) { newKey }.toHexString()
+        try {
+            HistoryDatabase(targetContext, name).use { helper ->
+                val history = CompanionHistory(helper)
+                val connection = CompanionConnection(targetContext, history)
+                ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+                    server.soTimeout = 8_000
+                    val fixture = launch(Dispatchers.IO) {
+                        server.accept().use { socket ->
+                            socket.soTimeout = 10_000
+                            val input = DataInputStream(socket.getInputStream())
+                            val output = socket.getOutputStream()
+                            var key = oldKey
+                            var label = "Testgerät"
+                            fun frame(payload: ByteArray) {
+                                output.write(byteArrayOf(0x3e, payload.size.toByte(), 0) + payload)
+                            }
+                            while (true) {
+                                val marker = input.read()
+                                if (marker == -1) break
+                                check(marker == 0x3c)
+                                val size = input.readUnsignedByte() or (input.readUnsignedByte() shl 8)
+                                val command = ByteArray(size).also(input::readFully)
+                                when (command[0].toInt()) {
+                                    1 -> frame(ByteBuffer.allocate(58 + label.encodeToByteArray().size)
+                                        .order(ByteOrder.LITTLE_ENDIAN).apply {
+                                            put(5).put(1).put(10).put(22)
+                                            put(ByteArray(32) { key })
+                                            putLong(0).putInt(0)
+                                            putInt(869_525).putInt(62_500).put(8).put(5)
+                                            put(label.encodeToByteArray())
+                                        }.array())
+                                    4 -> {
+                                        frame(byteArrayOf(2, 0, 0, 0, 0))
+                                        frame(byteArrayOf(4, 0, 0, 0, 0))
+                                    }
+                                    8 -> {
+                                        label = command.decodeToString(1)
+                                        frame(byteArrayOf(0))
+                                    }
+                                    0x0a -> frame(byteArrayOf(0x0a))
+                                    0x14, 0x38 -> frame(byteArrayOf(15))
+                                    0x16 -> frame(ByteArray(82).apply {
+                                        this[0] = 13
+                                        this[1] = 14
+                                        this[2] = 50
+                                    })
+                                    23 -> frame(byteArrayOf(14) + ByteArray(64) { key })
+                                    24 -> {
+                                        key = command[1]
+                                        frame(byteArrayOf(0))
+                                        frame(publicFrame)
+                                    }
+                                    0x28 -> frame(byteArrayOf(0x15))
+                                    0x40 -> frame(byteArrayOf(0x1c))
+                                    else -> error("Unerwarteter Companion-Testbefehl")
+                                }
+                            }
+                        }
+                    }
+                    try {
+                        connection.connect(checkNotNull(TcpEndpoint.parse("127.0.0.1", server.localPort))) {}
+                        val ready = withTimeout(8_000) {
+                            connection.status.first { it.management?.let { status -> status.available && !status.busy } == true }
+                        }
+                        val session = checkNotNull(ready.management).session
+                        val captured = connection.captureSetup(session, includeIdentity = true)
+                        check(captured.publicKey == oldId && captured.privateKey?.all { it == oldKey } == true)
+                        val replacement = CompanionSetup(
+                            captured.self.copyOfRange(0, 58).apply { fill(newKey, 4, 36) } + "Ersatzgerät".encodeToByteArray(),
+                            captured.version, captured.repeat, captured.pathWidth, captured.gps, captured.scope,
+                            captured.channels, captured.contacts, ByteArray(64) { newKey },
+                        )
+                        connection.restoreSetup(session, replacement, restoreIdentity = true)
+                        connection.withDisconnectedHistory {
+                            val before = history.journal(oldId, null, null, null).newestFirst
+                            val after = history.journal(newId, null, null, null).newestFirst
+                            check(before.none { it.frame.code == 14 || it.frame.bytes.contentEquals(publicFrame) })
+                            check(after.any { it.frame.bytes.contentEquals(publicFrame) })
+                        }
+                        check(!connection.status.value.active)
+                    } finally {
+                        connection.disconnect()
+                    }
+                    fixture.join()
+                }
+            }
+        } finally {
+            targetContext.deleteDatabase(name)
+        }
     }
 
     private suspend fun verifyWriteAndPaging(history: CompanionHistory) {
@@ -360,6 +551,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("ALTER TABLE private_send DROP COLUMN attempts")
                 db.execSQL("ALTER TABLE private_send DROP COLUMN last_route")
                 db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
+                db.execSQL("DROP TABLE backup_state")
                 db.version = 7
             }
             HistoryDatabase(targetContext, file).use { helper ->
@@ -438,6 +630,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_wire_time")
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_scope_dirty")
                 db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
+                db.execSQL("DROP TABLE backup_state")
                 db.version = 2
             }
             val firstId = HistoryDatabase(targetContext, file).use { helper ->

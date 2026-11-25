@@ -50,6 +50,10 @@ internal class ReceptionWriter(
                     is Event.Identity -> {
                         previousWriter?.join()
                         val identified = current.companion
+                        if (companion?.id != identified.id) {
+                            decoding = ChannelDecoding.default
+                            decodedIdentities = null
+                        }
                         history.register(identified.id, identified.name, System.currentTimeMillis())
                         companion = identified
                         beforeIdentity.chunked(128).forEach { history.append(identified.id, session, it, decoding) }

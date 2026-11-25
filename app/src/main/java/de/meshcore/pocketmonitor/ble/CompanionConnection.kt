@@ -15,6 +15,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import androidx.core.content.edit
+import de.meshcore.pocketmonitor.backup.CompanionSetup
+import de.meshcore.pocketmonitor.backup.CompanionSetupTransfer
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.PrivateRetry
@@ -59,6 +61,7 @@ import de.meshcore.pocketmonitor.protocol.TracePhase
 import de.meshcore.pocketmonitor.protocol.TraceResponse
 import de.meshcore.pocketmonitor.protocol.TraceRun
 import de.meshcore.pocketmonitor.rx.RxFrame
+import de.meshcore.pocketmonitor.rx.isJournalable
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.KnownCompanion
 import de.meshcore.pocketmonitor.rx.HistoryChannel
@@ -68,7 +71,13 @@ import de.meshcore.pocketmonitor.tcp.CompanionTcpTransport
 import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import java.util.UUID
 import kotlin.random.Random
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -115,6 +124,10 @@ internal data class ManagementStatus(
     val pathHashWidth: Int?,
     val canSetPathHashWidth: Boolean,
 )
+
+private class SetupExchange(val reply: CompanionRead) {
+    val result = CompletableDeferred<ByteArray>()
+}
 
 private class ManagementTransaction(
     val action: CompanionAction,
@@ -242,6 +255,41 @@ internal class CompanionConnection(private val context: Context, private val his
     fun channelDecoding(journalName: String): ChannelDecoding? =
         channelCatalog?.takeIf { it.journalName == journalName }?.liveDecoding
 
+    private val setupDispatcher = handler.asCoroutineDispatcher("Companion-Verwaltung")
+    private var restoringHistory = false
+
+    suspend fun withDisconnectedHistory(block: suspend () -> Unit) = withContext(setupDispatcher) {
+        check(target == null && !restoringHistory) { "Für die App-Wiederherstellung zuerst den Companion trennen." }
+        restoringHistory = true
+        try {
+            previousWriter?.join()
+            withContext(Dispatchers.Main) { block() }
+        } finally {
+            restoringHistory = false
+        }
+    }
+
+    fun reloadRestoredPreferences() {
+        mutableTcpAutoReconnect.value = tcpPreferences.getBoolean("auto_reconnect", false)
+    }
+
+    suspend fun captureSetup(session: String, includeIdentity: Boolean): CompanionSetup =
+        withContext(setupDispatcher) {
+            val connection = checkNotNull(current) { "Companion ist getrennt." }
+            connection.withSetup(session, restore = false) { transfer, identity ->
+                transfer.capture(identity, includeIdentity)
+            }
+        }
+
+    suspend fun restoreSetup(session: String, setup: CompanionSetup, restoreIdentity: Boolean) {
+        withContext(setupDispatcher) {
+            val connection = checkNotNull(current) { "Companion ist getrennt." }
+            connection.withSetup(session, restore = true) { transfer, identity ->
+                transfer.restore(setup, identity, restoreIdentity)
+            }
+        }
+    }
+
     private var current: Session? = null
     private var previousWriter: Job? = null
     private sealed interface Target {
@@ -272,7 +320,9 @@ internal class CompanionConnection(private val context: Context, private val his
 
     private fun connect(request: Target, stopped: () -> Unit) {
         handler.post {
-            if (target == null) {
+            if (restoringHistory) {
+                stopped()
+            } else if (target == null) {
                 target = request
                 onStopped = stopped
                 connectedOnce = false
@@ -415,6 +465,10 @@ internal class CompanionConnection(private val context: Context, private val his
         private var contactTransfer: ContactListTransfer? = null
         private var contactCompletion: ((ContactListResult) -> Unit)? = null
         private var management: ManagementTransaction? = null
+        private var setupActive = false
+        private var setupExchange: SetupExchange? = null
+        private var setupIdentityChanging = false
+        private var pendingIdentityFrames: MutableList<RxFrame>? = null
         private var cliSequence = 0
         private var firmwareVersion: Int? = null
         private var pathHashWidth: Int? = null
@@ -544,6 +598,16 @@ internal class CompanionConnection(private val context: Context, private val his
         }
 
         private fun writeCompleted(status: Int?) = guarded {
+            setupExchange?.let { exchange ->
+                if (status == null) {
+                    exchange.reply.acknowledgeWrite()
+                    exchange.reply.result?.let(exchange.result::complete)
+                } else {
+                    exchange.result.completeExceptionally(IllegalStateException("Companion-Schreibbestätigung fehlt."))
+                    finish("Setup-Befehl unbestätigt. Companion erneut verbinden.", error = true)
+                }
+                return@guarded
+            }
             management?.reply?.let { reply ->
                 if (status == null) {
                     reply.acknowledgeWrite()
@@ -663,6 +727,11 @@ internal class CompanionConnection(private val context: Context, private val his
             guarded {
                 val elapsedMs = SystemClock.elapsedRealtime()
                 val frame = RxFrame(System.currentTimeMillis(), value.copyOf())
+                if (setupIdentityChanging) {
+                    journalSetupFrame(frame)
+                    receiveSetupFrame(frame)
+                    return@guarded
+                }
                 val step = messageSync
                 val queueEntry = step?.receive(frame.bytes) ?: QueuedMessage.isQueueEntry(frame.code)
                 if (queueEntry) {
@@ -706,6 +775,10 @@ internal class CompanionConnection(private val context: Context, private val his
                 if (frame.code == QueuedMessage.WAITING && frame.bytes.size == 1) {
                     messagesWaiting = true
                     handler.post(resumeMessageSync)
+                }
+                if (setupActive) {
+                    receiveSetupFrame(frame)
+                    return@guarded
                 }
                 management?.reply?.let { reply ->
                     val prefix = management?.cliPrefix
@@ -829,15 +902,18 @@ internal class CompanionConnection(private val context: Context, private val his
             if (!transportReady) return@guarded
             if (!contacts.canRefresh || channelQuery != null || telemetryQuery != null || messageSync != null ||
                 searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
-                management != null || privatePathQuery != null || commandChannelUncertain) {
+                management != null || setupActive || privatePathQuery != null || commandChannelUncertain) {
                 return@guarded
             }
             startContactTransfer()
         }
 
-        private fun startContactTransfer(completed: ((ContactListResult) -> Unit)? = null) {
+        private fun startContactTransfer(
+            onContact: ((ByteArray) -> Unit)? = null,
+            completed: ((ContactListResult) -> Unit)? = null,
+        ) {
             val contacts = mutableStatus.value.contacts
-            val transfer = ContactListTransfer()
+            val transfer = ContactListTransfer(onContact)
             contactTransfer = transfer
             contactCompletion = completed
             publishCommandState(contacts.copy(canRefresh = false, loading = true, error = null))
@@ -856,6 +932,12 @@ internal class CompanionConnection(private val context: Context, private val his
             val result = transfer.result
             if (result != null) {
                 contactTransfer = null
+                if (setupActive) {
+                    val contacts = mutableStatus.value.contacts
+                    publishCommandState(contacts.copy(canRefresh = !commandChannelUncertain, loading = false))
+                    completeContactTransfer(result)
+                    return
+                }
                 val previous = mutableStatus.value.contacts
                 val contacts = previous.completed(result)
                 if (contacts.book != previous.book) {
@@ -1007,7 +1089,7 @@ internal class CompanionConnection(private val context: Context, private val his
             if (initialTelemetryPending || !messagesWaiting || messageSync != null || !mutableStatus.value.active || initialMetadataPending ||
                 channelQuery != null || contactTransfer != null || telemetryQuery != null ||
                 searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
-                management != null || privatePathQuery != null || commandChannelUncertain
+                management != null || setupActive || privatePathQuery != null || commandChannelUncertain
             ) return
             if (mtu < CompanionProtocol.FULL_FRAME_MTU) {
                 messagesWaiting = false
@@ -1086,7 +1168,7 @@ internal class CompanionConnection(private val context: Context, private val his
             if (commandChannelUncertain) return@guarded
             if (contactTransfer != null || channelQuery != null || messageSync != null || telemetryQuery != null ||
                 searches.history.value.busy || traceCommand != null || group != null || privateCommand != null ||
-                management != null || privatePathQuery != null
+                management != null || setupActive || privatePathQuery != null
             ) {
                 handler.postDelayed(pollTelemetry, 1_000)
                 return@guarded
@@ -1231,7 +1313,7 @@ internal class CompanionConnection(private val context: Context, private val his
 
         private fun commandBusy(): Boolean = pending != null || initialMetadataPending || initialTelemetryPending ||
             group != null || privateCommand != null || contactTransfer != null || channelQuery != null ||
-            telemetryQuery != null || messageSync != null || searches.history.value.busy || management != null ||
+            telemetryQuery != null || messageSync != null || searches.history.value.busy || management != null || setupActive ||
             privatePathQuery != null || traceCommand != null
 
         fun watchPrivatePath(session: String, key: String, watching: Boolean) {
@@ -1291,6 +1373,111 @@ internal class CompanionConnection(private val context: Context, private val his
             }
             publishCommandState()
             handler.post(resumeMessageSync)
+        }
+
+        suspend fun <T> withSetup(
+            session: String,
+            restore: Boolean,
+            operation: suspend (CompanionSetupTransfer, String) -> T,
+        ): T {
+            check(transportReady && mutableStatus.value.management?.session == session) {
+                "Companion ist nicht mehr verbunden."
+            }
+            check(!commandChannelUncertain) { "Companion erneut verbinden." }
+            check(!commandBusy() && privateTx == null) { "Bitte den laufenden Companion-Vorgang abwarten." }
+            check(mtu >= CompanionProtocol.CONTACT_FRAME_MTU) { "Companion-Setup benötigt eine BLE-MTU von mindestens 151." }
+            check(!history.groupScopeDirty(checkNotNull(journalName))) {
+                "Der gespeicherte Standard-Scope ist unbestätigt. Companion erneut verbinden."
+            }
+            setupActive = true
+            publishCommandState()
+            var success = false
+            try {
+                val transfer = CompanionSetupTransfer(::exchangeSetup, ::readSetupContacts)
+                val result = operation(transfer, checkNotNull(journalName))
+                success = true
+                return result
+            } finally {
+                val interrupted = setupExchange != null || contactTransfer != null || commandChannelUncertain
+                if (restore || interrupted) {
+                    finish(
+                        if (success) "Setup wiederhergestellt. Companion erneut verbinden."
+                        else "Setup-Vorgang beendet. Companion erneut verbinden.",
+                        error = !success,
+                    )
+                }
+                setupActive = false
+                if (current === this) {
+                    publishCommandState()
+                    handler.post(resumeMessageSync)
+                }
+            }
+        }
+
+        private suspend fun exchangeSetup(reply: CompanionRead): ByteArray {
+            check(current === this) { "Verbindung beim Setup getrennt." }
+            check(reply.command.size <= mtu - 3) { "Setup-Befehl überschreitet das Transportlimit." }
+            val exchange = SetupExchange(reply)
+            setupExchange = exchange
+            try {
+                check(write(reply.command)) { "Setup-Befehl konnte nicht gesendet werden." }
+                return withTimeout(5_000) { exchange.result.await() }
+            } catch (_: TimeoutCancellationException) {
+                commandChannelUncertain = true
+                error("Keine passende Companion-Antwort. Ausführung unbestätigt.")
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                commandChannelUncertain = true
+                throw error
+            } finally {
+                setupExchange = null
+            }
+        }
+
+        private suspend fun readSetupContacts(): List<ByteArray> {
+            check(current === this) { "Verbindung bei der Kontaktabfrage getrennt." }
+            val frames = mutableListOf<ByteArray>()
+            val result = CompletableDeferred<ContactListResult>()
+            startContactTransfer(onContact = { frames.add(it) }) { result.complete(it) }
+            when (val contacts = result.await()) {
+                is ContactListResult.Failed -> error(contacts.message)
+                is ContactListResult.Complete -> return frames
+            }
+        }
+
+        private fun receiveSetupFrame(frame: RxFrame) {
+            val exchange = setupExchange
+            if (exchange != null) {
+                if (exchange.reply.command[0] == CompanionSetupTransfer.IMPORT_PRIVATE_KEY &&
+                    frame.code == CompanionProtocol.OK && frame.bytes.size == 1 && !setupIdentityChanging
+                ) {
+                    setupIdentityChanging = true
+                    pendingIdentityFrames = mutableListOf()
+                }
+                exchange.reply.receive(frame.bytes)
+                exchange.reply.result?.let(exchange.result::complete)
+            } else contactTransfer?.let { transfer ->
+                if (transfer.receive(frame.bytes)) contactProgress(transfer)
+            }
+        }
+
+        private fun journalSetupFrame(frame: RxFrame) {
+            val buffered = pendingIdentityFrames
+            if (buffered == null) {
+                if (!writer.offer(frame)) finish("RX-Journal konnte ein Ereignis nicht übernehmen.", error = true)
+                return
+            }
+            if (frame.isJournalable()) buffered.add(frame)
+            if (buffered.size > 8192) {
+                finish("Zu viele RX-Ereignisse beim Wechsel der Companion-Identität.", error = true)
+                return
+            }
+            if (setupExchange?.reply?.command?.firstOrNull()?.toInt() != Command.APP_START.code) return
+            val identity = CompanionProtocol.selfIdentity(frame.bytes) ?: return
+            val name = GroupSend.selfName(frame.bytes)?.decodeToString()?.takeUnless(String::isBlank)
+            if (!writer.identify(KnownCompanion(identity, name ?: target.name)) || !buffered.all(writer::offer)) {
+                finish("RX-Journal konnte den Identitätswechsel nicht übernehmen.", error = true)
+            }
+            pendingIdentityFrames = null
         }
 
         fun manage(session: String, action: CompanionAction, completed: (Result<String?>) -> Unit) = guarded {
@@ -2231,7 +2418,7 @@ internal class CompanionConnection(private val context: Context, private val his
 
         private fun discoverUnavailable(): String? = when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
-            management != null -> "Ein Companion-Befehl läuft …"
+            management != null || setupActive -> "Ein Companion-Befehl läuft …"
             group != null -> "Kanalnachricht wird gesendet …"
             privateCommand != null -> "Private Nachricht wird an den Companion übergeben …"
             privatePathQuery != null -> "Warte auf den Kontaktpfad …"
@@ -2389,6 +2576,10 @@ internal class CompanionConnection(private val context: Context, private val his
                 "Verbindung getrennt. Ausführung des Companion-Befehls unbestätigt.",
             )))
             management = null
+            if (setupActive) {
+                setupExchange?.result?.completeExceptionally(IllegalStateException("Verbindung beim Setup getrennt. Ausführung unbestätigt."))
+                completeContactTransfer(ContactListResult.Failed("Verbindung bei der Kontaktabfrage getrennt."))
+            }
             contactCompletion = null
             handler.removeCallbacks(pollTelemetry)
             handler.removeCallbacks(resumeMessageSync)
@@ -2413,7 +2604,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val syncError = if (state.syncingMessages || (state.contacts.journalName != null && messagesWaiting)) {
                 "Nachrichtenabgleich unterbrochen. Beim nächsten Verbinden wird die restliche Warteschlange abgerufen."
             } else state.messageSyncError
-            if (retry && connectedOnce && (!isTcp || tcpAutoReconnect.value)) {
+            if (retry && !setupActive && connectedOnce && (!isTcp || tcpAutoReconnect.value)) {
                 val delaySeconds = retryDelaySeconds
                 retryDelaySeconds = (delaySeconds * 2).coerceAtMost(30)
                 mutableStatus.value = ConnectionStatus(

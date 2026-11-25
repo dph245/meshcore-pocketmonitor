@@ -3,6 +3,7 @@ package de.meshcore.pocketmonitor
 import android.Manifest
 import android.app.NotificationManager
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +19,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.edit
 import androidx.lifecycle.ViewModelProvider
 import de.meshcore.pocketmonitor.ble.scanPermissions
+import de.meshcore.pocketmonitor.ui.BackupViewModel
 import de.meshcore.pocketmonitor.ui.MonitorScreen
 import de.meshcore.pocketmonitor.ui.MonitorViewModel
 
@@ -25,6 +27,9 @@ class MainActivity : ComponentActivity() {
     private var keepScreenOn by mutableStateOf(false)
     private var openMessagesRequest by mutableIntStateOf(0)
     private lateinit var model: MonitorViewModel
+    private val screenPreference = SharedPreferences.OnSharedPreferenceChangeListener { preferences, key ->
+        if (key == null || key == KEEP_SCREEN_ON) reloadScreenPreference(preferences)
+    }
     private val requestScan = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         if (hasScanPermissions()) model.startScan() else model.permissionDenied()
     }
@@ -36,11 +41,13 @@ class MainActivity : ComponentActivity() {
         model = ViewModelProvider(this)[MonitorViewModel::class.java]
         handleNotification(intent)
         val preferences = getPreferences(MODE_PRIVATE)
-        keepScreenOn = preferences.getBoolean(KEEP_SCREEN_ON, false)
-        updateScreenFlag()
+        reloadScreenPreference(preferences)
+        val backupModel = ViewModelProvider(this)[BackupViewModel::class.java]
         setContent {
             MonitorScreen(
                 model,
+                backupModel = backupModel,
+                onAppRestored = model::refreshRestoredHistory,
                 onScan = {
                     if (hasScanPermissions()) model.startScan() else requestScan.launch(scanPermissions())
                 },
@@ -66,11 +73,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        val preferences = getPreferences(MODE_PRIVATE)
+        preferences.registerOnSharedPreferenceChangeListener(screenPreference)
+        reloadScreenPreference(preferences)
         (application as PocketMonitorApplication).activityVisible = true
         getSystemService(NotificationManager::class.java).cancel(CompanionReceiveService.MESSAGE_NOTIFICATION)
     }
 
     override fun onStop() {
+        getPreferences(MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(screenPreference)
         (application as PocketMonitorApplication).activityVisible = false
         model.stopScan()
         super.onStop()
@@ -92,6 +103,11 @@ class MainActivity : ComponentActivity() {
             preferences.edit { putBoolean(ASKED_NOTIFICATIONS, true) }
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+    }
+
+    private fun reloadScreenPreference(preferences: SharedPreferences) {
+        keepScreenOn = preferences.getBoolean(KEEP_SCREEN_ON, false)
+        updateScreenFlag()
     }
 
     private fun updateScreenFlag() {

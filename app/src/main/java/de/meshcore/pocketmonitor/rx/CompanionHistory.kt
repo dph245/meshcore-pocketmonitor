@@ -22,6 +22,7 @@ import de.meshcore.pocketmonitor.protocol.PacketType
 import de.meshcore.pocketmonitor.ui.ChannelMessage
 import de.meshcore.pocketmonitor.ui.channelClock
 import de.meshcore.pocketmonitor.ui.decodeRadioRow
+import java.io.File
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
@@ -52,6 +53,34 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     val configRevision: Long get() = configChanges.get()
     val revision: Long get() = changes.get()
     private val db: SQLiteDatabase get() = helper.writableDatabase
+
+    fun exportDatabase(context: Context, file: File) {
+        HistoryDatabase(context, file.path).use { snapshot ->
+            snapshot.setWriteAheadLoggingEnabled(false)
+            HistoryBackup.snapshot(db, snapshot.writableDatabase)
+        }
+    }
+
+    fun validateDatabase(file: File) {
+        HistoryBackup.open(file).use { HistoryBackup.validate(it, db.version) }
+    }
+
+    fun restoreDatabase(file: File, restoreId: String, restorePreferences: () -> Unit) {
+        val database = db
+        HistoryBackup.open(file).use { source ->
+            HistoryBackup.replace(database, source) {
+                database.execSQL("UPDATE private_send SET status = 'UNKNOWN' WHERE status IN ('WAITING', 'ACCEPTED')")
+                database.delete("backup_state", null, null)
+                database.execSQL("INSERT INTO backup_state VALUES (?)", arrayOf(restoreId))
+                restorePreferences()
+            }
+        }
+        configChanges.incrementAndGet()
+        changes.incrementAndGet()
+    }
+
+    fun restoreCommitted(id: String): Boolean =
+        db.rawQuery("SELECT 1 FROM backup_state WHERE restore_id = ?", arrayOf(id)).use { it.moveToFirst() }
 
     fun register(id: String, name: String, time: Long) {
         val database = db

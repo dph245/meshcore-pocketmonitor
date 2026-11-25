@@ -9,7 +9,7 @@ internal sealed interface ContactListResult {
 }
 
 /** One unfiltered GET_CONTACTS exchange. Notifications may precede the GATT write callback. */
-internal class ContactListTransfer {
+internal class ContactListTransfer(private val onContact: ((ByteArray) -> Unit)? = null) {
     private var writeAcknowledged = false
     private var expectedCount: Long? = null
     private val contacts = linkedMapOf<String, CompanionContact>()
@@ -35,7 +35,7 @@ internal class ContactListTransfer {
                     val count = expectedCount
                     if (contact == null || count == null || contacts.size >= count ||
                         contacts.putIfAbsent(contact.publicKey, contact) != null
-                    ) invalid = true
+                    ) invalid = true else onContact?.invoke(frame)
                 }
             }
             CompanionProtocol.CONTACTS_END -> {

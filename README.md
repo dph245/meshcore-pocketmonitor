@@ -9,7 +9,7 @@ Native Android-App in Kotlin und Jetpack Compose. Die App verbindet sich per Blu
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Die kompakte Icon-Leiste enthält **Live-Funk** (Funkwellen), **DISCOVER** (Lupe), **Nachrichten** (Sprechblase) und **Verbindung** (Bluetooth). Langes Drücken zeigt den Namen; Screenreader lesen die Tab-Namen und ungelesenen Hinweise vor. Auch die Untertabs nutzen Icons. Beim ersten Öffnen erscheint **Verbindung** mit Gerätesuche, Verbinden/Trennen, Kontakten, Akku, Noise Floor und **Display aktiv halten**.
+Die kompakte Icon-Leiste enthält **Live-Funk** (Funkwellen), **DISCOVER** (Lupe), **Nachrichten** (Sprechblase) und **Verbindung** (Zahnrad). Langes Drücken zeigt den Namen; Screenreader lesen die Tab-Namen und ungelesenen Hinweise vor. Auch die Untertabs nutzen Icons. Beim ersten Öffnen erscheint **Verbindung** mit Gerätesuche, Verbinden/Trennen, Kontakten, Akku, Noise Floor und **Display aktiv halten**.
 
 1. Im Tab **Verbindung** startet **Geräte suchen** unter **Bluetooth** einen bis zu zwölf Sekunden langen Scan nach connectable BLE-Geräten, die den Nordic UART Service ankündigen. Unter Android 12+ benötigt die App die Berechtigung für Geräte in der Nähe. Unter Android 8–11 erfordert der BLE-Scan präzisen Standort und einen aktivierten Systemstandort.
 2. Gerät im Auswahlmenü wählen und **Verbinden** antippen. Wenn Android eine Kopplung verlangt, den PIN des Companions im Systemdialog eingeben.
@@ -17,7 +17,17 @@ Die kompakte Icon-Leiste enthält **Live-Funk** (Funkwellen), **DISCOVER** (Lupe
 4. **Live-Funk** zeigt die neuesten Funkpakete zuerst. Antippen öffnet die Paketdetails mit Hop-Präfixen, vollständigen Namen, Auflösungsstatus und vollständigem Hexdump. **Rohdaten** zeigt auch Companion-Antworten und unbekannte Events. **Pause** oder Ziehen an der Liste friert den sichtbaren Ausschnitt ein. **Fortsetzen** springt zu den neuesten Einträgen. **Trennen** schließt die GATT-Verbindung und lässt das Journal auslaufen.
 5. Im Tab **DISCOVER** startet **DISCOVER senden** einen Suchlauf. Das Dropdown zeigt die Suchläufe mit Startzeit, Tag und Antwortzahl. Unter dem Dropdown stehen Status und Antworten des ausgewählten Laufs. Beim Senden wird der neue Lauf automatisch ausgewählt. Die App behält frühere Läufe während der App-Sitzung auch über Verbindungswechsel hinweg.
 
-BLEBeacons diente als Vorlage für Gradle, Activity, ViewModel, Berechtigungsabfrage, Scan-Callbacks und lokale Dateiaufzeichnung. GATT und Companion-Protokoll sind hier implementiert. TCP und der OpenStreetMap-Kartenpicker verwenden die Android-Internetberechtigung. Die App arbeitet ohne Cloud oder MQTT. App-Daten sind von Backup und Gerätetransfer ausgeschlossen.
+BLEBeacons diente als Vorlage für Gradle, Activity, ViewModel, Berechtigungsabfrage, Scan-Callbacks und lokale Dateiaufzeichnung. GATT und Companion-Protokoll sind hier implementiert. TCP und der OpenStreetMap-Kartenpicker verwenden die Android-Internetberechtigung. Die App arbeitet ohne Cloud oder MQTT. App-Daten sind vom automatischen Android-Backup und Android-Gerätetransfer ausgeschlossen.
+
+## Backup und Wiederherstellung
+
+Im Tab **Verbindung → Backup und Wiederherstellung** lassen sich zwei Arten von `.pmbackup`-Dateien erstellen. Android öffnet die Dateiauswahl. Für jede Datei wird ein Passwort mit mindestens zwölf Zeichen benötigt. Die App verschlüsselt Inhalt und Schlüssel per AES-256-GCM und leitet den Dateischlüssel mit PBKDF2-HMAC-SHA-256 ab.
+
+- **App-Daten sichern** enthält einen konsistenten SQLite-Snapshot aller lokalen Companion-Historien mit Chats, Lesestatus und RX-Rohdaten sowie die App-Einstellungen. Zum Wiederherstellen den Companion trennen, **Sicherung öffnen** wählen, das Passwort eingeben und das Ersetzen der lokalen Daten bestätigen.
+- **Companion-Setup sichern** liest Gerätename, Funkparameter und Sendeleistung, Position, Advert- und Telemetrieparameter, unterstützte GPS-, Multi-ACK- und Pfadoptionen, Standard-Scope, Kanäle einschließlich Kanalschlüsseln und die vom Companion gelieferten Kontakte. Zum Wiederherstellen das Ziel über BLE oder TCP verbinden und die Sicherung öffnen. Gesicherte Kanal-Slots werden einschließlich leerer Slots übernommen. Weitere Slots und zusätzliche Zielkontakte bleiben erhalten. Kontakte werden anhand ihrer vollständigen öffentlichen Schlüssel zugeordnet. Gerätespezifische Zugangsdaten wie WLAN-Passwort und BLE-PIN sind vom Setup-Export ausgenommen.
+- **Privaten Identitätsschlüssel mitsichern** ist beim Export optional. Beim Restore gibt es eine eigene Auswahl zum Ersetzen der Zielidentität. Schlüsselimport und -export hängen vom Firmware-Build ab. MeshCore `26079dea` kann beide Befehle separat deaktivieren. Bei einer Ablehnung des Imports bleibt das übrige Setup bis zu einem erneuten Restore ohne Identitätswechsel unverändert. TCP überträgt Companion-Daten ohne Transportverschlüsselung.
+
+Nach dem Setup-Restore wird der Companion getrennt. Beim Identitätsumzug den bisherigen Companion ausschalten und das Ersatzgerät neu verbinden. Wenn die Firmware eine Änderung mitten im Restore ablehnt oder die Verbindung abbricht, können vorherige Schritte bereits übernommen sein. PocketMonitor meldet den Abbruch und sendet keine ausstehenden Änderungen automatisch erneut.
 
 ## TCP-Verbindung
 
