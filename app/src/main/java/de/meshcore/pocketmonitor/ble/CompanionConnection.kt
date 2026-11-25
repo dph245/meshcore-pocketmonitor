@@ -17,6 +17,7 @@ import android.os.SystemClock
 import androidx.core.content.edit
 import de.meshcore.pocketmonitor.backup.CompanionSetup
 import de.meshcore.pocketmonitor.backup.CompanionSetupTransfer
+import de.meshcore.pocketmonitor.backup.SetupRestoreProgress
 import de.meshcore.pocketmonitor.protocol.GroupSend
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.PrivateRetry
@@ -281,14 +282,18 @@ internal class CompanionConnection(private val context: Context, private val his
             }
         }
 
-    suspend fun restoreSetup(session: String, setup: CompanionSetup, restoreIdentity: Boolean) {
+    suspend fun restoreSetup(
+        session: String,
+        setup: CompanionSetup,
+        restoreIdentity: Boolean,
+        onProgress: (SetupRestoreProgress) -> Unit,
+    ): Int =
         withContext(setupDispatcher) {
             val connection = checkNotNull(current) { "Companion ist getrennt." }
             connection.withSetup(session, restore = true) { transfer, identity ->
-                transfer.restore(setup, identity, restoreIdentity)
+                transfer.restore(setup, identity, restoreIdentity, onProgress)
             }
         }
-    }
 
     private var current: Session? = null
     private var previousWriter: Job? = null
@@ -522,7 +527,7 @@ internal class CompanionConnection(private val context: Context, private val his
                         },
                         onWritten = { writeCompleted(null) },
                         onFrame = ::receive,
-                        onClosed = { message, retry -> finish(message, error = true, retry = retry) },
+                        onClosed = { message, retry -> transportClosed(message, error = true, retry = retry) },
                     ).also { it.start() }
                 }
             }
@@ -536,9 +541,9 @@ internal class CompanionConnection(private val context: Context, private val his
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) = guarded {
             when {
                 status != BluetoothGatt.GATT_SUCCESS ->
-                    finish("BLE-Verbindung beendet (GATT $status).", error = true, retry = true)
+                    transportClosed("BLE-Verbindung beendet (GATT $status).", error = true, retry = true)
                 newState == BluetoothProfile.STATE_DISCONNECTED ->
-                    finish("Companion hat die Verbindung getrennt.", retry = true)
+                    transportClosed("Companion hat die Verbindung getrennt.", error = false, retry = true)
                 newState == BluetoothProfile.STATE_CONNECTED -> {
                     waitFor("Handle BLE-MTU aus …", 10_000)
                     if (!gatt.requestMtu(CompanionProtocol.REQUESTED_MTU)) {
@@ -1521,6 +1526,7 @@ internal class CompanionConnection(private val context: Context, private val his
             val command = when (action) {
                 is CompanionAction.SetScope -> CompanionManagement.scopeCommand(action.name)
                 is CompanionAction.SendAdvert -> CompanionManagement.advertCommand(action.flood)
+                CompanionAction.Reboot -> CompanionManagement.rebootCommand()
                 is CompanionAction.SetPosition -> CompanionManagement.positionCommand(action.position)
                 CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings,
                 is CompanionAction.SetOtherParam -> Command.APP_START.encode()
@@ -1557,6 +1563,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 }
                 is CompanionAction.RunCli ->
                     writeManagement(CompanionRead(command, CompanionManagement.CLI_REPLY))
+                CompanionAction.Reboot -> writeManagement(CompanionRead(command, responseCode = null))
                 else -> writeManagement(CompanionRead(command, CompanionProtocol.OK))
             }
         }
@@ -1619,7 +1626,10 @@ internal class CompanionConnection(private val context: Context, private val his
             publishCommandState()
             if (write(reply.command)) {
                 timeout = Runnable {
-                    finishManagement(error = "Keine passende Companion-Antwort. Ausführung unbestätigt.", uncertain = true)
+                    val error = if (tx.action == CompanionAction.Reboot) {
+                        "Die Verbindung wurde nach dem Neustartbefehl nicht getrennt. Neustart unbestätigt."
+                    } else "Keine passende Companion-Antwort. Ausführung unbestätigt."
+                    finishManagement(error = error, uncertain = true)
                 }.also { handler.postDelayed(it, 5_000) }
             } else if (tx.verifyingChannel) {
                 channelChangeUnconfirmed("Kanaländerung angenommen. Slot konnte nicht zurückgelesen werden.")
@@ -1650,6 +1660,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 return
             }
             when (val action = tx.action) {
+                CompanionAction.Reboot -> Unit // Explicit rejections are handled above.
                 CompanionAction.ReadLocationSettings -> {
                     if (reply.command[0].toInt() == Command.APP_START.code) {
                         updateFromSelfInfo(frame)
@@ -2542,6 +2553,17 @@ internal class CompanionConnection(private val context: Context, private val his
                 finish("Bluetooth-Berechtigung fehlt.", error = true)
             } catch (_: IllegalStateException) {
                 finish("Companion-Verbindung ist nicht mehr verfügbar.", error = true, retry = true)
+            }
+        }
+
+        private fun transportClosed(message: String, error: Boolean, retry: Boolean) {
+            val tx = management
+            if (tx?.action == CompanionAction.Reboot && tx.reply?.writeAcknowledged == true && retry) {
+                management = null
+                finish("Verbindung nach Neustartbefehl getrennt.", retry = true)
+                tx.completed(Result.success(null))
+            } else {
+                finish(message, error, retry)
             }
         }
 

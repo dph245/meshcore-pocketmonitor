@@ -8,6 +8,15 @@ import de.meshcore.pocketmonitor.protocol.CompanionProtocol
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol.Command
 import de.meshcore.pocketmonitor.protocol.CompanionRead
 
+internal enum class SetupRestoreStage { PREPARING, SETTINGS, CHANNELS, CONTACTS, VERIFYING_CONTACTS, VERIFYING_SETTINGS }
+
+internal data class SetupRestoreProgress(
+    val stage: SetupRestoreStage = SetupRestoreStage.PREPARING,
+    val restoredChannels: Int = 0,
+    val restoredContacts: Int = 0,
+    val skippedContacts: Int = 0,
+)
+
 internal class CompanionSetupTransfer(
     private val exchange: suspend (CompanionRead) -> ByteArray,
     private val readContacts: suspend () -> List<ByteArray>,
@@ -32,7 +41,12 @@ internal class CompanionSetupTransfer(
         }
     }
 
-    suspend fun restore(source: CompanionSetup, targetKey: String, restoreIdentity: Boolean) {
+    suspend fun restore(
+        source: CompanionSetup,
+        targetKey: String,
+        restoreIdentity: Boolean,
+        onProgress: (SetupRestoreProgress) -> Unit = {},
+    ): Int {
         val device = readDevice()
         val target = readSelf(targetKey)
         val actualRadio = SetupRadio.read(target)
@@ -43,18 +57,14 @@ internal class CompanionSetupTransfer(
             canonicalScope(success(exchange(ChannelQuery()), "Standard-Scope lesen"))
         } else ByteArray(0)
         val targetChannels = List(minOf(source.channels.size, device.slots)) { readChannel(it) }
-        val targetContacts = readContacts().associateBy { it.contactKey() }
-        val resultingCount = (targetContacts.keys + source.contacts.map { it.contactKey() }).size
-        check(device.maxContacts >= resultingCount || resultingCount == targetContacts.size) {
-            "Der Companion hat zu wenige freie Kontaktplätze."
-        }
         check(source.channels.drop(device.slots).all(ChannelQuery::emptySlot)) {
             "Auf dem Ziel-Companion fehlen belegte Kanal-Slots aus der Sicherung."
         }
         check(source.txPower <= target[3].toInt()) { "Die Sendeleistung der Sicherung übersteigt das Zielgerätelimit." }
-        check(device.pathWidth != 0 || (source.pathWidth <= 1 &&
-            source.contacts.all { it[35].toUByte().toInt() in 0..63 || it[35] == 0xff.toByte() })) {
-            "Das Zielgerät unterstützt keine Mehrbyte-Pfade."
+        if (device.pathWidth == 0) {
+            check(source.pathWidth <= 1) { "Das Zielgerät unterstützt keine Mehrbyte-Pfade." }
+            val existingKeys = readContacts().mapTo(mutableSetOf()) { it.contactKey() }
+            checkContactPaths(contactsThatFit(source.contacts, existingKeys, device.maxContacts), device)
         }
         check(source.other.multiAcks != true || device.version >= 7) { "Das Zielgerät unterstützt keine Multi-ACKs." }
         check(source.repeat != 1 || device.repeat >= 0) { "Das Zielgerät unterstützt den Client-Repeater-Modus nicht." }
@@ -69,12 +79,18 @@ internal class CompanionSetupTransfer(
 
         var step = "Identität"
         var attemptedWrite = false
+        var progress = SetupRestoreProgress()
+        fun report(update: SetupRestoreProgress) {
+            progress = update
+            onProgress(update)
+        }
         suspend fun apply(label: String, bytes: ByteArray) {
             step = label
             attemptedWrite = true
             write(bytes, label)
         }
         try {
+            report(progress.copy(stage = SetupRestoreStage.SETTINGS))
             if (desiredKey != targetKey) {
                 val command = byteArrayOf(IMPORT_PRIVATE_KEY) + checkNotNull(source.privateKey)
                 try {
@@ -120,25 +136,55 @@ internal class CompanionSetupTransfer(
                     "Standard-Scope stimmt nach dem Schreiben nicht überein."
                 }
             }
+            report(progress.copy(stage = SetupRestoreStage.CHANNELS))
             for (index in targetChannels.indices) {
                 val channel = source.channels[index]
                 if (!channel.contentEquals(targetChannels[index])) {
                     apply("Kanal-Slot $index", channel.asCommand(32))
                     check(readChannel(index).contentEquals(channel)) { "Kanal-Slot $index stimmt nach dem Schreiben nicht überein." }
                 }
-            }
-
-            // Import reloads the Companion's persisted contacts. Read again before merging.
-            val currentContacts = if (desiredKey != targetKey) readContacts().associateBy { it.contactKey() } else targetContacts
-            val toWrite = source.contacts.filter { !it.contentEquals(currentContacts[it.contactKey()]?.let { frame -> canonicalContact(frame, device.version) }) }
-            for (contact in toWrite) apply("Kontakte", contact.asCommand(9))
-            if (toWrite.isNotEmpty()) {
-                val actual = readContacts().associateBy { it.contactKey() }
-                check(toWrite.all { it.contentEquals(actual[it.contactKey()]?.let { frame -> canonicalContact(frame, device.version) }) }) {
-                    "Kontaktbestand stimmt nach dem Schreiben nicht überein."
+                if (!ChannelQuery.emptySlot(channel)) {
+                    report(progress.copy(restoredChannels = progress.restoredChannels + 1))
                 }
             }
+
+            step = "Kontakte"
+            report(progress.copy(stage = SetupRestoreStage.CONTACTS))
+            // Import reloads persisted contacts, and live adverts can change the remaining capacity.
+            val currentContacts = readContacts().associateBy { it.contactKey() }
+            val selectedContacts = contactsThatFit(source.contacts, currentContacts.keys, device.maxContacts)
+            checkContactPaths(selectedContacts, device)
+            report(progress.copy(skippedContacts = source.contacts.size - selectedContacts.size))
+            var tableFull = false
+            val writtenContacts = mutableListOf<ByteArray>()
+            for (contact in selectedContacts) {
+                val previous = currentContacts[contact.contactKey()]
+                if (!contact.contentEquals(previous?.let { canonicalContact(it, device.version) })) {
+                    if (previous == null && tableFull) {
+                        report(progress.copy(skippedContacts = progress.skippedContacts + 1))
+                        continue
+                    }
+                    attemptedWrite = true
+                    val reply = exchange(CompanionRead(contact.asCommand(ADD_UPDATE_CONTACT), CompanionProtocol.OK))
+                    if (previous == null && reply.contentEquals(byteArrayOf(CompanionProtocol.ERROR.toByte(), CONTACT_TABLE_FULL))) {
+                        tableFull = true
+                        report(progress.copy(skippedContacts = progress.skippedContacts + 1))
+                        continue
+                    }
+                    expectWriteOk(reply, step)
+                    writtenContacts.add(contact)
+                }
+                report(progress.copy(restoredContacts = progress.restoredContacts + 1))
+            }
+            if (writtenContacts.isNotEmpty()) {
+                report(progress.copy(stage = SetupRestoreStage.VERIFYING_CONTACTS))
+                val actual = readContacts().associateBy { it.contactKey() }
+                check(writtenContacts.all { contact ->
+                    contact.contentEquals(actual[contact.contactKey()]?.let { canonicalContact(it, device.version) })
+                }) { "Kontaktbestand stimmt nach dem Schreiben nicht überein." }
+            }
             step = "Einstellungen zurücklesen"
+            report(progress.copy(stage = SetupRestoreStage.VERIFYING_SETTINGS))
             val verified = readSelf(desiredKey)
             val verifiedDevice = readDevice()
             val verifiedOther = CompanionManagement.otherParams(verified)
@@ -150,9 +196,30 @@ internal class CompanionSetupTransfer(
                 (source.pathWidth == 0 || device.pathWidth == 0 || source.pathWidth == verifiedDevice.pathWidth)) {
                 "Companion-Einstellungen stimmen nach dem Schreiben nicht vollständig überein."
             }
+            return progress.skippedContacts
         } catch (error: IllegalStateException) {
             if (!attemptedWrite) throw error
             throw IllegalStateException("$step: ${error.message} Der Companion kann teilweise geändert sein.", error)
+        }
+    }
+
+    private fun contactsThatFit(contacts: List<ByteArray>, existing: Set<String>, maxContacts: Int): List<ByteArray> {
+        var freeSlots = (maxContacts - existing.size).coerceAtLeast(0)
+        return buildList {
+            for (contact in contacts) {
+                if (contact.contactKey() in existing) {
+                    add(contact)
+                } else if (freeSlots > 0) {
+                    add(contact)
+                    freeSlots--
+                }
+            }
+        }
+    }
+
+    private fun checkContactPaths(contacts: List<ByteArray>, device: Device) {
+        check(device.pathWidth != 0 || contacts.all { it[35].toUByte().toInt() in 0..63 || it[35] == 0xff.toByte() }) {
+            "Das Zielgerät unterstützt keine Mehrbyte-Pfade."
         }
     }
 
@@ -206,7 +273,10 @@ internal class CompanionSetupTransfer(
     }
 
     private suspend fun write(bytes: ByteArray, label: String) {
-        val reply = exchange(CompanionRead(bytes, CompanionProtocol.OK))
+        expectWriteOk(exchange(CompanionRead(bytes, CompanionProtocol.OK)), label)
+    }
+
+    private fun expectWriteOk(reply: ByteArray, label: String) {
         check(!reply.isUnsupported()) { "$label: Die Firmware unterstützt den Befehl nicht." }
         check(success(reply, label).contentEquals(byteArrayOf(CompanionProtocol.OK.toByte()))) {
             "$label: Ungültige Bestätigung."
@@ -260,5 +330,7 @@ internal class CompanionSetupTransfer(
 
     companion object {
         const val IMPORT_PRIVATE_KEY: Byte = 24
+        private const val ADD_UPDATE_CONTACT: Byte = 9
+        private const val CONTACT_TABLE_FULL: Byte = 3
     }
 }

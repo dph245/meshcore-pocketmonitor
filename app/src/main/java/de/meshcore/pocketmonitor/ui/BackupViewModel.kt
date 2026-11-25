@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import de.meshcore.pocketmonitor.PocketMonitorApplication
 import de.meshcore.pocketmonitor.backup.BackupContents
+import de.meshcore.pocketmonitor.backup.SetupRestoreProgress
 import java.io.EOFException
 import java.io.IOException
 import javax.crypto.AEADBadTagException
@@ -22,9 +23,15 @@ internal sealed interface BackupState {
     data object Idle : BackupState
     data class Password(val action: BackupAction, val uri: Uri) : BackupState
     data class Preview(val contents: BackupContents) : BackupState
-    data object Working : BackupState
+    data class Working(val setup: SetupRestore? = null) : BackupState
     data class Notice(val message: String) : BackupState
 }
+
+internal data class SetupRestore(
+    val channels: Int,
+    val contacts: Int,
+    val progress: SetupRestoreProgress = SetupRestoreProgress(),
+)
 
 internal class BackupViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as PocketMonitorApplication
@@ -37,14 +44,14 @@ internal class BackupViewModel(application: Application) : AndroidViewModel(appl
     val state = mutableState.asStateFlow()
 
     fun select(action: BackupAction, uri: Uri) {
-        if (mutableState.value == BackupState.Working) return
+        if (mutableState.value is BackupState.Working) return
         discard()
         mutableState.value = BackupState.Password(action, uri)
     }
 
     fun discard() {
         val previous = mutableState.value
-        if (previous == BackupState.Working) return
+        if (previous is BackupState.Working) return
         (previous as? BackupState.Preview)?.contents?.close()
         mutableState.value = BackupState.Idle
     }
@@ -83,7 +90,10 @@ internal class BackupViewModel(application: Application) : AndroidViewModel(appl
 
     fun restore(session: String?, includeIdentity: Boolean, onAppRestored: suspend () -> Unit) {
         val preview = mutableState.value as? BackupState.Preview ?: return
-        runOperation {
+        val restore = (preview.contents as? BackupContents.Setup)?.setup?.let {
+            SetupRestore(it.configuredChannels, it.contacts.size)
+        }
+        runOperation(BackupState.Working(restore)) {
             preview.contents.use { contents ->
                 when (contents) {
                     is BackupContents.App -> {
@@ -95,16 +105,25 @@ internal class BackupViewModel(application: Application) : AndroidViewModel(appl
                         BackupState.Notice("App-Daten und Einstellungen wurden wiederhergestellt.")
                     }
                     is BackupContents.Setup -> {
-                        connection.restoreSetup(checkNotNull(session) { "Companion ist getrennt." }, contents.setup, includeIdentity)
-                        BackupState.Notice("Companion-Setup wiederhergestellt. Verbinde den Companion erneut.")
+                        val skippedContacts = connection.restoreSetup(
+                            checkNotNull(session) { "Companion ist getrennt." }, contents.setup, includeIdentity,
+                        ) { progress ->
+                            mutableState.value = BackupState.Working(checkNotNull(restore).copy(progress = progress))
+                        }
+                        val contactNotice = when (skippedContacts) {
+                            0 -> ""
+                            1 -> " Ein Kontakt wurde aus Platzgründen ausgelassen."
+                            else -> " $skippedContacts Kontakte wurden aus Platzgründen ausgelassen."
+                        }
+                        BackupState.Notice("Companion-Setup wiederhergestellt.$contactNotice Verbinde den Companion erneut.")
                     }
                 }
             }
         }
     }
 
-    private fun runOperation(block: suspend () -> BackupState) {
-        mutableState.value = BackupState.Working
+    private fun runOperation(state: BackupState.Working = BackupState.Working(), block: suspend () -> BackupState) {
+        mutableState.value = state
         viewModelScope.launch {
             mutableState.value = try {
                 block()

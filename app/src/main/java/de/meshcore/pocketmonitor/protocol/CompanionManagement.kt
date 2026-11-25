@@ -38,6 +38,7 @@ internal sealed interface CompanionAction {
     }
     data class ResetPrivatePath(val key: String) : CompanionAction
     data class RunCli(val text: String) : CompanionAction
+    data object Reboot : CompanionAction
 }
 
 internal data class CompanionOtherParams(
@@ -95,10 +96,13 @@ internal object CompanionManagement {
     private const val SET_CUSTOM_VAR: Byte = 0x29
     private const val ADD_CONTACT: Byte = 0x09
     private const val REMOVE_CONTACT: Byte = 0x0f
+    private const val REBOOT: Byte = 0x13
     private const val RUN_CLI: Byte = 0x42
     private val publicKeyPattern = Regex("[0-9a-fA-F]{64}")
 
     fun advertCommand(flood: Boolean): ByteArray = byteArrayOf(SEND_ADVERT, if (flood) 1 else 0)
+
+    fun rebootCommand(): ByteArray = byteArrayOf(REBOOT) + "reboot".encodeToByteArray()
 
     fun positionCommand(position: CompanionPosition): ByteArray =
         ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).put(SET_POSITION)

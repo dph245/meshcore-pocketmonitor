@@ -30,6 +30,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import de.meshcore.pocketmonitor.backup.BackupContents
+import de.meshcore.pocketmonitor.backup.SetupRestoreStage
 import de.meshcore.pocketmonitor.ble.ConnectionStatus
 
 @Composable
@@ -104,7 +105,7 @@ internal fun BackupDialog(
                                 if (target != null) {
                                     Text("Ziel · ${target.take(12)}")
                                 } else Text("Verbinde zuerst das Zielgerät. Öffne danach die Sicherung erneut.")
-                                Text("${setup.configuredChannels} belegte Kanal-Slots und ${setup.contacts.size} Kontakte. Funk- und Advert-Einstellungen sowie gesicherte Slots werden übernommen. Weitere Kontakte auf dem Ziel bleiben erhalten.")
+                                Text("${setup.configuredChannels} belegte Kanal-Slots und ${setup.contacts.size} Kontakte. Funk- und Advert-Einstellungen sowie gesicherte Slots werden übernommen. Weitere Kontakte auf dem Ziel bleiben erhalten. Neue Kontakte ohne freien Platz werden ausgelassen.")
                                 if (setup.privateKey != null && target != null && target != setup.publicKey) {
                                     BackupCheckbox("Identität auf das Zielgerät übertragen", includeIdentity) { includeIdentity = it }
                                     if (includeIdentity) {
@@ -126,10 +127,30 @@ internal fun BackupDialog(
                 dismissButton = { TextButton(onClick = model::discard) { Text("Abbrechen") } },
             )
         }
-        BackupState.Working -> AlertDialog(
+        is BackupState.Working -> AlertDialog(
             onDismissRequest = {},
-            title = { Text("Sicherung wird verarbeitet") },
-            text = { CircularProgressIndicator() },
+            title = { Text(if (current.setup == null) "Sicherung wird verarbeitet" else "Companion-Setup wird wiederhergestellt") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator()
+                    current.setup?.let { restore ->
+                        val progress = restore.progress
+                        Text(when (progress.stage) {
+                            SetupRestoreStage.PREPARING -> "Zielgerät wird geprüft …"
+                            SetupRestoreStage.SETTINGS -> "Einstellungen werden übertragen …"
+                            SetupRestoreStage.CHANNELS -> "Kanal-Slots werden übertragen und geprüft …"
+                            SetupRestoreStage.CONTACTS -> "Kontakte werden übertragen …"
+                            SetupRestoreStage.VERIFYING_CONTACTS -> "Kontakte werden zurückgelesen …"
+                            SetupRestoreStage.VERIFYING_SETTINGS -> "Einstellungen werden zurückgelesen …"
+                        })
+                        Text("Kanäle wiederhergestellt: ${progress.restoredChannels}/${restore.channels}")
+                        Text("Kontakte wiederhergestellt: ${progress.restoredContacts}/${restore.contacts}")
+                        if (progress.skippedContacts > 0) {
+                            Text("Kontakte ohne freien Platz: ${progress.skippedContacts}")
+                        }
+                    }
+                }
+            },
             confirmButton = {},
         )
         is BackupState.Notice -> AlertDialog(

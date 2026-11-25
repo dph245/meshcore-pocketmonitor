@@ -107,11 +107,12 @@ internal class PendingReply(val command: CompanionProtocol.Command) {
 /** A Companion read completes once both its reply and its GATT write acknowledgement arrive. */
 internal open class CompanionRead(
     val command: ByteArray,
-    private val responseCode: Int,
+    private val responseCode: Int?,
     private val responseSubtype: Int? = null,
 ) {
     private var writeComplete = false
     private var reply: ByteArray? = null
+    val writeAcknowledged: Boolean get() = writeComplete
     val result: ByteArray? get() = reply.takeIf { writeComplete }
 
     fun acknowledgeWrite() {
@@ -122,7 +123,7 @@ internal open class CompanionRead(
         if (reply != null) return
         val code = frame.firstOrNull()?.toInt()?.and(0xff)
         if (code == CompanionProtocol.ERROR || code == CompanionProtocol.DISABLED ||
-            (code == responseCode &&
+            (responseCode != null && code == responseCode &&
                 (responseSubtype == null || frame.getOrNull(1)?.toInt()?.and(0xff) == responseSubtype))
         ) {
             reply = frame

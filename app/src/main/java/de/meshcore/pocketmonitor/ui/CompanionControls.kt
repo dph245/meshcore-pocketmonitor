@@ -23,13 +23,14 @@ import de.meshcore.pocketmonitor.ble.ManagementStatus
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 
-private enum class CompanionPanel { SCOPE, CONTACTS, CLI, POSITION, LOCATION_SETTINGS, RADIO_SETTINGS }
+private enum class CompanionPanel { SCOPE, CONTACTS, CLI, POSITION, LOCATION_SETTINGS, RADIO_SETTINGS, REBOOT }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus, model: MonitorViewModel) {
     var panel by remember(status.session) { mutableStateOf<CompanionPanel?>(null) }
     var advertPending by remember(status.session) { mutableStateOf(false) }
+    var rebootPending by remember(status.session) { mutableStateOf(false) }
     var feedback by remember(status.session) { mutableStateOf<Result<String>?>(null) }
     val ready = status.available && !status.busy
 
@@ -71,11 +72,15 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
         OutlinedButton(onClick = { panel = CompanionPanel.RADIO_SETTINGS }, enabled = status.available) {
             Text("Funkeinstellungen")
         }
+        OutlinedButton(onClick = { panel = CompanionPanel.REBOOT }, enabled = ready && !rebootPending) {
+            Text("Companion neu starten")
+        }
     }
     if (advertPending) Text("Warte auf die Bestätigung des Companion …", style = MaterialTheme.typography.bodySmall)
+    if (rebootPending) Text("Warte darauf, dass der Companion die Verbindung trennt …", style = MaterialTheme.typography.bodySmall)
     feedback?.fold(
         onSuccess = { Text(it, style = MaterialTheme.typography.bodySmall) },
-        onFailure = { Text(it.message ?: "Advert fehlgeschlagen.", color = MaterialTheme.colorScheme.error) },
+        onFailure = { Text(it.message ?: "Companion-Befehl fehlgeschlagen.", color = MaterialTheme.colorScheme.error) },
     )
     if (!status.available) {
         Text("Companion erneut verbinden, um Befehle auszuführen.", color = MaterialTheme.colorScheme.error)
@@ -123,6 +128,26 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
             status = status,
             onAction = { action, completed -> model.manageCompanion(status.session, action, completed) },
             onDismiss = { panel = null },
+        )
+        CompanionPanel.REBOOT -> AlertDialog(
+            onDismissRequest = { panel = null },
+            title = { Text("Companion neu starten?") },
+            text = { Text("Beim Neustart wird die Verbindung getrennt.") },
+            confirmButton = {
+                TextButton(
+                    enabled = ready && !rebootPending,
+                    onClick = {
+                        panel = null
+                        rebootPending = true
+                        feedback = null
+                        model.manageCompanion(status.session, CompanionAction.Reboot) { result ->
+                            rebootPending = false
+                            feedback = result.map { "Verbindung nach Neustartbefehl getrennt." }
+                        }
+                    },
+                ) { Text("Neu starten") }
+            },
+            dismissButton = { TextButton(onClick = { panel = null }) { Text("Abbrechen") } },
         )
         null -> Unit
     }

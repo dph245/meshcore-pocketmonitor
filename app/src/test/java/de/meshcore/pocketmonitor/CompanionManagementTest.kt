@@ -5,6 +5,7 @@ import de.meshcore.pocketmonitor.protocol.CompanionContact
 import de.meshcore.pocketmonitor.protocol.CompanionGps
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 import de.meshcore.pocketmonitor.protocol.CompanionPosition
+import de.meshcore.pocketmonitor.protocol.CompanionRead
 import de.meshcore.pocketmonitor.protocol.ContactCategory
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -14,6 +15,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CompanionManagementTest {
+    @Test
+    fun rebootHasNoSuccessReplyButCanBeRejected() {
+        val command = CompanionManagement.rebootCommand()
+        assertArrayEquals("137265626f6f74".hexToByteArray(), command)
+        val request = CompanionRead(command, responseCode = null)
+        request.receive(byteArrayOf())
+        request.receive(byteArrayOf(0))
+        request.acknowledgeWrite()
+        assertTrue(request.writeAcknowledged)
+        assertNull(request.result)
+
+        val rejected = byteArrayOf(1, 1)
+        request.receive(rejected)
+        assertArrayEquals(rejected, request.result)
+    }
+
     @Test
     fun selfAdvertRoutesHaveDistinctModeBytes() {
         assertArrayEquals(byteArrayOf(0x07, 0x00), CompanionManagement.advertCommand(flood = false))
