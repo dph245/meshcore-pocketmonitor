@@ -99,6 +99,7 @@ internal fun MonitorScreen(
     val companions by model.companions.collectAsStateWithLifecycle()
     val companion by model.selectedCompanion.collectAsStateWithLifecycle()
     val historyReady by model.historyReady.collectAsStateWithLifecycle()
+    val historyCleanup by model.historyCleanup.collectAsStateWithLifecycle()
     val historyError by model.historyError.collectAsStateWithLifecycle()
     val restoreRevision by model.restoreRevision.collectAsStateWithLifecycle()
     val tabState = key(restoreRevision) { rememberSaveableStateHolder() }
@@ -233,9 +234,10 @@ internal fun MonitorScreen(
                             val uptime = connection.uptimeSeconds?.let(::formatUptime) ?: "—"
                             Text("Uptime $uptime", style = MaterialTheme.typography.bodySmall)
                         }
-                        OutlinedButton(onClick = { backupOpen = true }) {
+                        OutlinedButton(onClick = { backupOpen = true }, enabled = !historyCleanup.running) {
                             Text("Backup und Wiederherstellung")
                         }
+                        HistoryStorage(model, historyReady, historyCleanup)
                         connection.management?.let { management ->
                             CompanionControls(management, contacts, model)
                         }

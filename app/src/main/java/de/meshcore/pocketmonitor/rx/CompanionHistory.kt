@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteException
 import de.meshcore.pocketmonitor.protocol.GroupSendStatus
 import de.meshcore.pocketmonitor.protocol.PrivateSendRoute
 import de.meshcore.pocketmonitor.protocol.PrivateSendStatus
@@ -40,6 +41,7 @@ internal data class DecodedMessage(
     val payload: MeshPayload.GroupText,
     val comparison: String,
 )
+internal data class HistoryCleanup(val deletedMessages: Int, val compacted: Boolean)
 
 internal const val PRIVATE_ID_PREFIX = "pm:"
 
@@ -53,6 +55,47 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     val configRevision: Long get() = configChanges.get()
     val revision: Long get() = changes.get()
     private val db: SQLiteDatabase get() = helper.writableDatabase
+
+    fun databaseSizeBytes(): Long {
+        val path = db.path
+        return File(path).length() + File("$path-wal").length() + File("$path-shm").length()
+    }
+
+    fun deleteMessagesBefore(cutoff: Long): HistoryCleanup {
+        val database = db
+        val deleted = database.inTransaction {
+            var count = 0
+            var afterId = 0L
+            while (true) {
+                val ids = database.rawQuery("""
+                    SELECT message.id FROM message
+                    LEFT JOIN group_send ON group_send.message_id = message.id
+                    LEFT JOIN private_send ON private_send.message_id = message.id
+                    WHERE message.id > ? AND coalesce(group_send.created_at, private_send.created_at,
+                        (SELECT max(received_at) FROM rx WHERE rx.message_id = message.id)) < CAST(? AS INTEGER)
+                    ORDER BY message.id LIMIT 500
+                """, arrayOf(afterId.toString(), cutoff.toString())).use { cursor -> cursor.collect { getLong(0) } }
+                if (ids.isEmpty()) break
+                val args = ids.map(Long::toString).toTypedArray()
+                val messages = "SELECT id FROM message WHERE id IN (${ids.joinToString(",") { "?" }})"
+                discardMessageLinks(database, messages, args)
+                count += database.delete("message", "id IN ($messages)", args)
+                afterId = ids.last()
+            }
+            count
+        }
+        if (deleted > 0) changes.incrementAndGet()
+
+        val compacted = try {
+            database.execSQL("VACUUM")
+            database.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use {
+                it.moveToFirst() && it.getInt(0) == 0
+            }
+        } catch (_: SQLiteException) {
+            false
+        }
+        return HistoryCleanup(deleted, compacted)
+    }
 
     fun exportDatabase(context: Context, file: File) {
         HistoryDatabase(context, file.path).use { snapshot ->
@@ -151,16 +194,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
             ).use { it.moveToFirst() }
             if (!archived) return@inTransaction false
             val messages = "SELECT id FROM message WHERE companion = ? AND channel = ?"
-            // Preserve the original frames and exclude them from later channel backfills.
-            database.execSQL(
-                "UPDATE rx SET message_id = NULL, message_discarded = 1 WHERE message_id IN ($messages)",
-                args,
-            )
-            database.execSQL("""
-                UPDATE rx SET message_discarded = 1 WHERE id IN (
-                    SELECT rx_id FROM group_repeat WHERE send_id IN ($messages)
-                )
-            """, args)
+            discardMessageLinks(database, messages, args)
             database.delete("message", "companion = ? AND channel = ?", args)
             database.delete("group_scope", "companion = ? AND channel = ?", args)
             database.delete("channel", "companion = ? AND identity = ?", args)
@@ -168,6 +202,19 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         }
         if (deleted) changes.incrementAndGet()
         return deleted
+    }
+
+    private fun discardMessageLinks(database: SQLiteDatabase, messages: String, args: Array<String>) {
+        // Keep the original journal frames and exclude them from later backfills.
+        database.execSQL(
+            "UPDATE rx SET message_id = NULL, message_discarded = 1 WHERE message_id IN ($messages)",
+            args,
+        )
+        database.execSQL("""
+            UPDATE rx SET message_discarded = 1 WHERE id IN (
+                SELECT rx_id FROM group_repeat WHERE send_id IN ($messages)
+            )
+        """, args)
     }
 
     fun beginGroup(companion: String, channel: HistoryChannel, text: String, now: Long, scope: String,

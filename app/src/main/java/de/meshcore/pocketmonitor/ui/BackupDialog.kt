@@ -67,7 +67,11 @@ internal fun BackupDialog(
                         enabled = historyReady,
                     ) { Text("App-Daten sichern") }
                     OutlinedButton(
-                        onClick = { setupDocument.launch("PocketMonitor-Companion.pmbackup") },
+                        onClick = {
+                            setupDocument.launch(
+                                companionBackupFileName(connection.companionName, connection.contacts.journalName),
+                            )
+                        },
                         enabled = setupReady,
                     ) { Text("Companion-Setup sichern") }
                     OutlinedButton(onClick = { openDocument.launch(arrayOf("*/*")) }, enabled = historyReady) {
@@ -160,6 +164,15 @@ internal fun BackupDialog(
             confirmButton = { TextButton(onClick = model::discard) { Text("OK") } },
         )
     }
+}
+
+private val backupFileNameSeparators = Regex("""[<>:"/\\|?*\p{Cc}\p{Cf}\p{Z}]+""")
+
+internal fun companionBackupFileName(name: String?, publicKey: String?): String {
+    val label = name?.replace(backupFileNameSeparators, "-")?.trim('.', '-')?.takeIf(String::isNotEmpty)
+        ?: publicKey?.take(12)?.takeIf(String::isNotEmpty)
+    val suffix = label?.let { "-$it" }.orEmpty()
+    return "PocketMonitor-Companion$suffix.pmbackup"
 }
 
 @Composable

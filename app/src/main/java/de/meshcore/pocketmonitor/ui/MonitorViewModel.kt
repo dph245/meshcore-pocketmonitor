@@ -2,6 +2,7 @@ package de.meshcore.pocketmonitor.ui
 
 import android.app.Application
 import android.content.Context
+import android.database.sqlite.SQLiteException
 import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import de.meshcore.pocketmonitor.CompanionReceiveService
 import de.meshcore.pocketmonitor.PocketMonitorApplication
@@ -56,6 +57,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val historyError = mutableHistoryError.asStateFlow()
     private val mutableHistoryReady = MutableStateFlow(false)
     val historyReady = mutableHistoryReady.asStateFlow()
+    private val mutableHistoryCleanup = MutableStateFlow(HistoryCleanupState())
+    val historyCleanup = mutableHistoryCleanup.asStateFlow()
     private val mutableRestoreRevision = MutableStateFlow(0)
     val restoreRevision = mutableRestoreRevision.asStateFlow()
     private val mutableScan = MutableStateFlow(ScanState())
@@ -170,6 +173,37 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
         mutableHistoryError.value = null
         mutablePrivateOptionsRevision.value++
         mutableRestoreRevision.value++
+    }
+
+    suspend fun databaseSizeBytes(): Long? = withContext(Dispatchers.IO) {
+        try {
+            history.databaseSizeBytes()
+        } catch (_: SQLiteException) {
+            null
+        }
+    }
+
+    fun deleteOldMessages(days: Int) {
+        if (!historyReady.value || mutableHistoryCleanup.value.running) return
+        val cutoff = System.currentTimeMillis() - days * 86_400_000L
+        mutableHistoryCleanup.value = HistoryCleanupState(running = true)
+        viewModelScope.launch {
+            mutableHistoryCleanup.value = try {
+                val result = withContext(Dispatchers.IO) { history.deleteMessagesBefore(cutoff) }
+                val deleted = when (result.deletedMessages) {
+                    0 -> "Keine passenden Nachrichten gefunden."
+                    1 -> "1 Nachricht gelöscht."
+                    else -> "${result.deletedMessages} Nachrichten gelöscht."
+                }
+                HistoryCleanupState(
+                    message = if (result.compacted) "$deleted Datenbank verdichtet."
+                        else "$deleted Datenbank konnte nicht vollständig verdichtet werden.",
+                    error = !result.compacted,
+                )
+            } catch (_: SQLiteException) {
+                HistoryCleanupState(message = "Alte Nachrichten konnten nicht gelöscht werden.", error = true)
+            }
+        }
     }
 
     fun selectHistory(id: String) {

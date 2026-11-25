@@ -98,6 +98,7 @@ internal data class ConnectionStatus(
     val discoverUnavailable: String? = "Zuerst einen Companion verbinden.",
     val traceSender: TraceSender? = null,
     val tcp: Boolean = false,
+    val companionName: String? = null,
 )
 
 internal data class TraceSender(val session: String, val mtu: Int, val unavailable: String?)
@@ -895,6 +896,7 @@ internal class CompanionConnection(private val context: Context, private val his
                         ),
                         discoverUnavailable = discoverUnavailable(),
                         traceSender = traceSender(),
+                        companionName = selfName?.decodeToString(),
                     )
                     refreshContacts()
                     startInitialMetadata()

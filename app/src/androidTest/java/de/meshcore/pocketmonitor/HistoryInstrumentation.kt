@@ -84,10 +84,11 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyPrivateSend()
                 verifyPrivateAttemptMigration()
                 verifyArchiveDeletion()
+                verifyStorageCleanup()
                 verifyBackupRoundTrip(legacy)
                 verifyCompanionRestoreOverTcp()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging encrypted backup restore and simulated TCP setup\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, storage cleanup, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging, encrypted backup restore and simulated TCP setup\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -253,7 +254,7 @@ class HistoryInstrumentation : Instrumentation() {
                             captured.version, captured.repeat, captured.pathWidth, captured.gps, captured.scope,
                             captured.channels, captured.contacts, ByteArray(64) { newKey },
                         )
-                        connection.restoreSetup(session, replacement, restoreIdentity = true)
+                        connection.restoreSetup(session, replacement, restoreIdentity = true, onProgress = {})
                         connection.withDisconnectedHistory {
                             val before = history.journal(oldId, null, null, null).newestFirst
                             val after = history.journal(newId, null, null, null).newestFirst
@@ -339,6 +340,53 @@ class HistoryInstrumentation : Instrumentation() {
         check(history.journal(id, null, null, null).count == 0L)
         check(history.knownCompanions().size == 2)
         check(history.channels(id).single().identity == private.identity)
+    }
+
+    private fun verifyStorageCleanup() {
+        val name = "storage-test-${UUID.randomUUID()}.db"
+        try {
+            HistoryDatabase(targetContext, name).use { helper ->
+                val history = CompanionHistory(helper)
+                val cutoff = now - 60_000
+                val channel = HistoryChannel(public.identity, public.name, 0)
+                history.register(id, "Erster Companion", now)
+                history.register(other, "Zweiter Companion", now)
+                history.configure(id, listOf(ChannelSlot(0, public)), complete = true)
+                history.append(id, "old", listOf(Received(1, RxFrame(cutoff - 1, publicFrame))), ChannelDecoding.default)
+                history.append(other, "recent", listOf(
+                    Received(1, RxFrame(cutoff - 1, publicFrame)),
+                    Received(2, RxFrame(cutoff, publicFrame)),
+                ), ChannelDecoding.default)
+                val oldRx = history.newestId(id)
+                val contact = CompanionContact("CC".repeat(32), "Testkontakt", 1, 0, 0, "", 0, 0.0, 0.0, 0)
+                history.beginPrivate(other, contact, "Alte PN", cutoff - 1)
+                history.beginPrivate(other, contact, "Neue PN", cutoff)
+                repeat(600) {
+                    history.beginGroup(id, channel, "Alter Text ".repeat(18), cutoff - 1, "") { null }
+                }
+                history.beginGroup(id, channel, "Neuer Text", cutoff, "") { null }
+                val before = history.databaseSizeBytes()
+                val revision = history.revision
+
+                val result = history.deleteMessagesBefore(cutoff)
+                check(result.deletedMessages == 602 && result.compacted)
+                check(history.databaseSizeBytes() < before)
+                check(history.revision > revision)
+                check(history.channels(id, currentOnly = true).single().identity == public.identity)
+                check(history.messages(id, public.identity, null).rows.single().text == "Neuer Text")
+                check(history.messages(other, public.identity, null).rows.single().receptionCount == 2L)
+                check(history.messages(other, "pm:${contact.publicKey}", null).rows.single().text == "Neue PN")
+                val preserved = history.journal(id, null, null, null).newestFirst.single()
+                check(preserved.sequence == oldRx && preserved.frame.bytes.contentEquals(publicFrame))
+                val decoded = checkNotNull(decodeMessage(preserved.frame, ChannelDecoding.default))
+                history.linkDecoded(id, listOf(oldRx to decoded))
+                check(history.messages(id, public.identity, null).rows.single().text == "Neuer Text")
+                check(history.deleteMessagesBefore(cutoff).deletedMessages == 0)
+                helper.writableDatabase.rawQuery("PRAGMA foreign_key_check", null).use { check(!it.moveToFirst()) }
+            }
+        } finally {
+            targetContext.deleteDatabase(name)
+        }
     }
 
     private suspend fun verifyMessageSync() {
