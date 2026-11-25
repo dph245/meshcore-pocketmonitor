@@ -46,12 +46,55 @@ class CompanionManagementTest {
             this[46] = 0x39
             this[47] = 0xa5.toByte()
         }
-        val settings = checkNotNull(CompanionManagement.advertLocationSettings(info))
-        assertTrue(settings.enabled)
-        assertArrayEquals("26a53900".hexToByteArray(), CompanionManagement.advertLocationCommand(settings, enabled = false))
-        assertArrayEquals("26a53901".hexToByteArray(), CompanionManagement.advertLocationCommand(settings, enabled = true))
-        assertNull(CompanionManagement.advertLocationSettings(info.copyOf(47)))
-        assertNull(CompanionManagement.advertLocationSettings(info.copyOf().apply { this[0] = 0x01 }))
+        val settings = checkNotNull(CompanionManagement.otherParams(info))
+        assertTrue(settings.advertLocationEnabled)
+        assertArrayEquals("26a53900".hexToByteArray(),
+            CompanionManagement.otherParamCommand(settings, CompanionAction.SetAdvertLocation(false)))
+        assertArrayEquals("26a53901".hexToByteArray(),
+            CompanionManagement.otherParamCommand(settings, CompanionAction.SetAdvertLocation(true)))
+        assertNull(CompanionManagement.otherParams(info.copyOf(47)))
+        assertNull(CompanionManagement.otherParams(info.copyOf().apply { this[0] = 0x01 }))
+    }
+
+    @Test
+    fun multiAcksPreservesOtherParamsAndDecodesOnlyBinaryValues() {
+        val info = ByteArray(58).apply {
+            this[0] = 0x05
+            this[45] = 0x02 // Preserve the full advert-location policy.
+            this[46] = 0x39
+            this[47] = 0xa5.toByte()
+        }
+        val off = checkNotNull(CompanionManagement.otherParams(info))
+        assertEquals(false, off.multiAcks)
+        assertArrayEquals("26a5390201".hexToByteArray(),
+            CompanionManagement.otherParamCommand(off, CompanionAction.SetMultiAcks(true)))
+        info[44] = 1
+        val on = checkNotNull(CompanionManagement.otherParams(info))
+        assertEquals(true, on.multiAcks)
+        assertArrayEquals("26a5390200".hexToByteArray(),
+            CompanionManagement.otherParamCommand(on, CompanionAction.SetMultiAcks(false)))
+        info[44] = 2
+        assertNull(checkNotNull(CompanionManagement.otherParams(info)).multiAcks)
+    }
+
+    @Test
+    fun pathHashWidthUsesZeroBasedModesAndRequiresCompleteDeviceInfo() {
+        val info = ByteArray(82).apply {
+            this[0] = 0x0d
+            this[1] = 10
+        }
+        for (width in 1..3) {
+            val mode = (width - 1).toByte()
+            info[81] = mode
+            assertEquals(width, CompanionManagement.pathHashWidth(info))
+            assertArrayEquals(byteArrayOf(0x3d, 0, mode), CompanionManagement.pathHashCommand(width))
+        }
+        assertNull(CompanionManagement.pathHashWidth(info.copyOf(81)))
+        assertNull(CompanionManagement.pathHashWidth(info.copyOf().apply { this[0] = 0x05 }))
+        assertNull(CompanionManagement.pathHashWidth(info.copyOf().apply { this[1] = 9 }))
+        assertNull(CompanionManagement.pathHashWidth(info.copyOf().apply { this[81] = 3 }))
+        assertNull(CompanionManagement.pathHashCommand(0))
+        assertNull(CompanionManagement.pathHashCommand(4))
     }
 
     @Test

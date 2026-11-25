@@ -34,7 +34,7 @@ import de.meshcore.pocketmonitor.protocol.ChannelReference
 import de.meshcore.pocketmonitor.protocol.reference
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
-import de.meshcore.pocketmonitor.protocol.AdvertLocationSettings
+import de.meshcore.pocketmonitor.protocol.CompanionOtherParams
 import de.meshcore.pocketmonitor.protocol.CompanionGps
 import de.meshcore.pocketmonitor.protocol.CompanionPosition
 import de.meshcore.pocketmonitor.protocol.CompanionProtocol
@@ -110,6 +110,10 @@ internal data class ManagementStatus(
     val advertLocationEnabled: Boolean?,
     val canSetAdvertLocation: Boolean,
     val gps: CompanionGps,
+    val multiAcks: Boolean?,
+    val canSetMultiAcks: Boolean,
+    val pathHashWidth: Int?,
+    val canSetPathHashWidth: Boolean,
 )
 
 private class ManagementTransaction(
@@ -118,7 +122,7 @@ private class ManagementTransaction(
 ) {
     var reply: CompanionRead? = null
     var verifyingScope: ByteArray? = null
-    var verifyingAdvertLocation = false
+    var verifyingOtherParam = false
     var cliPrefix: String? = null
     var channelChange: ChannelChange? = null
     var verifyingChannel = false
@@ -374,7 +378,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private val displayName: String
             get() = if (isTcp) selfName?.decodeToString()?.takeUnless(String::isBlank) ?: target.name else target.name
         private var selfPosition: CompanionPosition? = null
-        private var advertLocation: AdvertLocationSettings? = null
+        private var otherParams: CompanionOtherParams? = null
         private var gps = CompanionGps.UNKNOWN
         private var group: GroupTransaction? = null
         private var privateTx: PrivateTransmission? = null
@@ -413,7 +417,11 @@ internal class CompanionConnection(private val context: Context, private val his
         private var management: ManagementTransaction? = null
         private var cliSequence = 0
         private var firmwareVersion: Int? = null
-        private var pathHashWidth = 1
+        private var pathHashWidth: Int? = null
+        private val canSetMultiAcks get() = (firmwareVersion ?: 0) >= CompanionManagement.MULTI_ACKS_MIN_VERSION &&
+            mtu >= CompanionManagement.OTHER_PARAMS_INFO_SIZE + 3
+        private val canSetPathHashWidth get() = (firmwareVersion ?: 0) >= PrivateRoute.MULTIBYTE_MIN_VERSION &&
+            mtu >= CompanionManagement.PATH_HASH_INFO_SIZE + 3
         private var channelSlots = 0
         private var nextSlot = 0
         private var scopeQueried = false
@@ -767,16 +775,12 @@ internal class CompanionConnection(private val context: Context, private val his
                         return@guarded
                     }
                     journalName = identity
-                    selfPosition = CompanionManagement.selfPosition(frame.bytes)
-                    advertLocation = CompanionManagement.advertLocationSettings(frame.bytes)
+                    updateFromSelfInfo(frame.bytes)
                 }
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     val version = frame.bytes.getOrNull(1)?.toInt()?.and(0xff) ?: 0
                     firmwareVersion = version
-                    if (version >= PrivateRoute.MULTIBYTE_MIN_VERSION) {
-                        // Device info v10 appends the zero-based hash width at byte 81.
-                        pathHashWidth = frame.bytes.getOrNull(81)?.toInt()?.takeIf { it in 0..2 }?.plus(1) ?: 1
-                    }
+                    pathHashWidth = CompanionManagement.pathHashWidth(frame.bytes)
                     if (version >= 3 && mtu >= ChannelQuery.CHANNEL_MTU) {
                         channelSlots = frame.bytes.getOrNull(3)?.toInt()?.and(0xff) ?: 0
                     }
@@ -1164,9 +1168,13 @@ internal class CompanionConnection(private val context: Context, private val his
                     commandBusy() || privateTx != null,
                     !commandChannelUncertain,
                     selfPosition,
-                    advertLocation?.enabled,
+                    otherParams?.advertLocationEnabled,
                     (firmwareVersion ?: 0) >= CompanionManagement.LOCATION_PARAMS_MIN_VERSION,
                     gps,
+                    otherParams?.multiAcks.takeIf { canSetMultiAcks },
+                    canSetMultiAcks,
+                    pathHashWidth,
+                    canSetPathHashWidth,
                 )
             } else null
             mutableStatus.value = state.copy(
@@ -1189,7 +1197,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 PrivateSender(
                     discoverSession, id, sendableContacts,
                     contacts.book?.list?.contacts.orEmpty().filter { it.type == CompanionContact.TYPE_REPEATER },
-                    firmwareVersion ?: 0, pathHashWidth, PrivateSend.textLimit(mtu), privateTx != null || commandBusy(),
+                    firmwareVersion ?: 0, pathHashWidth ?: 1, PrivateSend.textLimit(mtu), privateTx != null || commandBusy(),
                 )
             } else null
             mutableGroupSender.value = if (id != null && catalog?.complete == true && !groupBlocked &&
@@ -1297,6 +1305,12 @@ internal class CompanionConnection(private val context: Context, private val his
                 action is CompanionAction.SetAdvertLocation &&
                     (firmwareVersion ?: 0) < CompanionManagement.LOCATION_PARAMS_MIN_VERSION ->
                     "Die Standortfreigabe ist auf dieser Firmware nicht einstellbar."
+                action is CompanionAction.SetMultiAcks && !canSetMultiAcks ->
+                    "Multi-ACKs benötigt Protokollversion 7 und BLE-MTU ≥ 61."
+                action is CompanionAction.SetPathHashWidth && !canSetPathHashWidth ->
+                    "Die Pfad-Hash-Länge benötigt Protokollversion 10 und BLE-MTU ≥ 85."
+                action == CompanionAction.ReadRadioSettings && !canSetMultiAcks && !canSetPathHashWidth ->
+                    "Keine Funkeinstellungen für diese Companion-Verbindung verfügbar."
                 action is CompanionAction.SetGpsEnabled && gps != CompanionGps.ENABLED && gps != CompanionGps.DISABLED ->
                     "Der Companion meldet kein steuerbares GPS-Modul."
                 action is CompanionAction.RunCli && (firmwareVersion ?: 0) < CompanionManagement.CLI_MIN_VERSION ->
@@ -1321,7 +1335,9 @@ internal class CompanionConnection(private val context: Context, private val his
                 is CompanionAction.SetScope -> CompanionManagement.scopeCommand(action.name)
                 is CompanionAction.SendAdvert -> CompanionManagement.advertCommand(action.flood)
                 is CompanionAction.SetPosition -> CompanionManagement.positionCommand(action.position)
-                CompanionAction.ReadLocationSettings, is CompanionAction.SetAdvertLocation -> Command.APP_START.encode()
+                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings,
+                is CompanionAction.SetOtherParam -> Command.APP_START.encode()
+                is CompanionAction.SetPathHashWidth -> CompanionManagement.pathHashCommand(action.bytes)
                 is CompanionAction.SetGpsEnabled -> CompanionManagement.gpsCommand(action.enabled)
                 is CompanionAction.AddContact -> CompanionManagement.addContact(action)
                 is CompanionAction.RemoveContact -> CompanionManagement.removeContact(action.key)
@@ -1338,6 +1354,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 finishManagement(error = when (action) {
                     is CompanionAction.SetScope -> CompanionManagement.SCOPE_INPUT_ERROR
                     is CompanionAction.RunCli -> "Ungültiges Kommando oder Längenlimit überschritten."
+                    is CompanionAction.SetPathHashWidth -> "Pfad-Hash-Länge muss 1, 2 oder 3 Byte sein."
                     else -> CompanionManagement.CONTACT_INPUT_ERROR
                 })
                 return@guarded
@@ -1345,8 +1362,9 @@ internal class CompanionConnection(private val context: Context, private val his
             when (action) {
                 is CompanionAction.AddContact, is CompanionAction.RemoveContact ->
                     prepareContactChange(action, command)
-                CompanionAction.ReadLocationSettings, is CompanionAction.SetAdvertLocation -> {
-                    advertLocation = null
+                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings,
+                is CompanionAction.SetOtherParam -> {
+                    otherParams = null
                     if (action == CompanionAction.ReadLocationSettings) gps = CompanionGps.UNKNOWN
                     writeManagement(CompanionRead(command, Command.APP_START.expectedReply))
                 }
@@ -1447,39 +1465,72 @@ internal class CompanionConnection(private val context: Context, private val his
             when (val action = tx.action) {
                 CompanionAction.ReadLocationSettings -> {
                     if (reply.command[0].toInt() == Command.APP_START.code) {
-                        updateLocationFromSelfInfo(frame)
+                        updateFromSelfInfo(frame)
                         readCompanionGps()
                     } else {
                         gps = CompanionManagement.gpsSetting(frame)
                         finishManagement(error = when {
                             gps == CompanionGps.UNKNOWN -> "GPS-Status konnte nicht gelesen werden."
-                            advertLocation == null -> "Standortfreigabe konnte nicht gelesen werden."
+                            otherParams == null -> "Standortfreigabe konnte nicht gelesen werden."
                             else -> null
                         })
                     }
                 }
-                is CompanionAction.SetAdvertLocation -> {
+                CompanionAction.ReadRadioSettings -> {
                     if (reply.command[0].toInt() == Command.APP_START.code) {
-                        updateLocationFromSelfInfo(frame)
-                        val current = advertLocation
+                        updateFromSelfInfo(frame)
+                        if (canSetPathHashWidth) {
+                            readPathHashWidth()
+                            return
+                        }
+                    } else pathHashWidth = CompanionManagement.pathHashWidth(frame)
+                    finishManagement(error = when {
+                        canSetMultiAcks && otherParams?.multiAcks == null -> "Multi-ACKs konnte nicht gelesen werden."
+                        canSetPathHashWidth && pathHashWidth == null -> "Pfad-Hash-Länge konnte nicht gelesen werden."
+                        else -> null
+                    })
+                }
+                is CompanionAction.SetOtherParam -> {
+                    val label = when (action) {
+                        is CompanionAction.SetAdvertLocation -> "Standortfreigabe"
+                        is CompanionAction.SetMultiAcks -> "Multi-ACKs"
+                    }
+                    if (reply.command[0].toInt() == Command.APP_START.code) {
+                        updateFromSelfInfo(frame)
+                        val current = otherParams
+                        val actual = when (action) {
+                            is CompanionAction.SetAdvertLocation -> current?.advertLocationEnabled
+                            is CompanionAction.SetMultiAcks -> current?.multiAcks
+                        }
                         when {
-                            tx.verifyingAdvertLocation -> finishManagement(
-                                error = if (current?.enabled == action.enabled) null
-                                    else "Der Companion hat die Standortfreigabe nicht bestätigt.",
+                            tx.verifyingOtherParam -> finishManagement(
+                                error = if (actual == action.enabled) null else "Companion hat „$label“ nicht bestätigt.",
                             )
-                            current == null -> finishManagement(error = "Standortfreigabe konnte nicht gelesen werden.")
-                            current.enabled == action.enabled -> finishManagement()
+                            current == null -> finishManagement(error = "„$label“ konnte nicht gelesen werden.")
+                            actual == action.enabled -> finishManagement()
                             else -> writeManagement(CompanionRead(
-                                CompanionManagement.advertLocationCommand(current, action.enabled), CompanionProtocol.OK,
+                                CompanionManagement.otherParamCommand(current, action), CompanionProtocol.OK,
                             ))
                         }
                     } else if (code == CompanionProtocol.OK && frame.size == 1) {
-                        advertLocation = null
-                        tx.verifyingAdvertLocation = true
+                        otherParams = null
+                        tx.verifyingOtherParam = true
                         writeManagement(CompanionRead(Command.APP_START.encode(), Command.APP_START.expectedReply))
                     } else {
-                        advertLocation = null
-                        finishManagement(error = "Ungültige Bestätigung der Standortfreigabe.")
+                        otherParams = null
+                        finishManagement(error = "Ungültige Bestätigung für „$label“.")
+                    }
+                }
+                is CompanionAction.SetPathHashWidth -> {
+                    if (reply.command[0].toInt() == Command.DEVICE_QUERY.code) {
+                        pathHashWidth = CompanionManagement.pathHashWidth(frame)
+                        finishManagement(error = if (pathHashWidth == action.bytes) null
+                            else "Companion hat die Pfad-Hash-Länge nicht bestätigt.")
+                    } else if (code == CompanionProtocol.OK && frame.size == 1) {
+                        readPathHashWidth()
+                    } else {
+                        pathHashWidth = null
+                        finishManagement(error = "Ungültige Bestätigung der Pfad-Hash-Länge.")
                     }
                 }
                 is CompanionAction.SetGpsEnabled -> {
@@ -1572,10 +1623,15 @@ internal class CompanionConnection(private val context: Context, private val his
             refreshChannels()
         }
 
-        private fun updateLocationFromSelfInfo(frame: ByteArray) {
+        private fun updateFromSelfInfo(frame: ByteArray) {
             if (CompanionProtocol.selfIdentity(frame) != journalName) return
-            advertLocation = CompanionManagement.advertLocationSettings(frame)
+            otherParams = CompanionManagement.otherParams(frame)
             CompanionManagement.selfPosition(frame)?.let { selfPosition = it }
+        }
+
+        private fun readPathHashWidth() {
+            pathHashWidth = null
+            writeManagement(CompanionRead(Command.DEVICE_QUERY.encode(), Command.DEVICE_QUERY.expectedReply))
         }
 
         private fun readCompanionGps() {
@@ -1614,7 +1670,8 @@ internal class CompanionConnection(private val context: Context, private val his
             if (uncertain) {
                 commandChannelUncertain = true
                 if (tx.action is CompanionAction.SetScope) updateDefaultScope(null)
-                if (tx.action is CompanionAction.SetAdvertLocation) advertLocation = null
+                if (tx.action is CompanionAction.SetOtherParam) otherParams = null
+                if (tx.action is CompanionAction.SetPathHashWidth) pathHashWidth = null
                 if (tx.action is CompanionAction.SetGpsEnabled) gps = CompanionGps.UNKNOWN
             }
             val contacts = mutableStatus.value.contacts

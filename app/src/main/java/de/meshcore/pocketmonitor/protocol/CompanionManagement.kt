@@ -22,7 +22,13 @@ internal sealed interface CompanionAction {
     data class SendAdvert(val flood: Boolean) : CompanionAction
     data class SetPosition(val position: CompanionPosition) : CompanionAction
     data object ReadLocationSettings : CompanionAction
-    data class SetAdvertLocation(val enabled: Boolean) : CompanionAction
+    data object ReadRadioSettings : CompanionAction
+    sealed interface SetOtherParam : CompanionAction {
+        val enabled: Boolean
+    }
+    data class SetAdvertLocation(override val enabled: Boolean) : SetOtherParam
+    data class SetMultiAcks(override val enabled: Boolean) : SetOtherParam
+    data class SetPathHashWidth(val bytes: Int) : CompanionAction
     data class SetGpsEnabled(val enabled: Boolean) : CompanionAction
     data class AddContact(val key: String, val name: String, val category: ContactCategory) : CompanionAction
     data class RemoveContact(val key: String) : CompanionAction
@@ -34,12 +40,13 @@ internal sealed interface CompanionAction {
     data class RunCli(val text: String) : CompanionAction
 }
 
-internal data class AdvertLocationSettings(
-    val policy: Int,
+internal data class CompanionOtherParams(
+    val advertLocationPolicy: Byte,
     val telemetry: Byte,
     val manualAddContacts: Byte,
+    val multiAcks: Boolean?,
 ) {
-    val enabled: Boolean get() = policy != 0
+    val advertLocationEnabled: Boolean get() = advertLocationPolicy != 0.toByte()
 }
 
 internal enum class CompanionGps { UNKNOWN, UNAVAILABLE, DISABLED, ENABLED }
@@ -73,6 +80,9 @@ internal object CompanionManagement {
     const val CLI_MIN_VERSION = 14
     const val CLI_REPLY = 0x1d
     const val LOCATION_PARAMS_MIN_VERSION = 5
+    const val MULTI_ACKS_MIN_VERSION = 7
+    const val OTHER_PARAMS_INFO_SIZE = 58
+    const val PATH_HASH_INFO_SIZE = 82
     const val CUSTOM_VARS = 0x15
     const val SCOPE_INPUT_ERROR = "Scope einschließlich # höchstens 30 UTF-8-Bytes, ohne Leer- oder Steuerzeichen."
     const val CONTACT_INPUT_ERROR = "Name mit 1–31 UTF-8-Bytes und öffentlicher Schlüssel mit 64 Hex-Zeichen erforderlich."
@@ -80,6 +90,7 @@ internal object CompanionManagement {
     private const val SEND_ADVERT: Byte = 0x07
     private const val SET_POSITION: Byte = 0x0e
     private const val SET_OTHER_PARAMS: Byte = 0x26
+    private const val SET_PATH_HASH_MODE: Byte = 0x3d
     const val GET_CUSTOM_VARS: Byte = 0x28
     private const val SET_CUSTOM_VAR: Byte = 0x29
     private const val ADD_CONTACT: Byte = 0x09
@@ -103,14 +114,37 @@ internal object CompanionManagement {
         return CompanionPosition(latitude, longitude)
     }
 
-    fun advertLocationSettings(frame: ByteArray): AdvertLocationSettings? {
-        if (frame.size < 58 || frame[0].toInt() != CompanionProtocol.Command.APP_START.expectedReply) return null
-        return AdvertLocationSettings(frame[45].toInt() and 0xff, frame[46], frame[47])
+    fun otherParams(frame: ByteArray): CompanionOtherParams? {
+        if (frame.size < OTHER_PARAMS_INFO_SIZE || frame[0].toInt() != CompanionProtocol.Command.APP_START.expectedReply) {
+            return null
+        }
+        val multiAcks = when (frame[44].toInt()) {
+            0 -> false
+            1 -> true
+            else -> null
+        }
+        return CompanionOtherParams(frame[45], frame[46], frame[47], multiAcks)
     }
 
     // The trailing Multi-ACK byte is optional. Omitting it leaves that setting untouched.
-    fun advertLocationCommand(current: AdvertLocationSettings, enabled: Boolean): ByteArray =
-        byteArrayOf(SET_OTHER_PARAMS, current.manualAddContacts, current.telemetry, if (enabled) 1 else 0)
+    fun otherParamCommand(current: CompanionOtherParams, action: CompanionAction.SetOtherParam): ByteArray =
+        when (action) {
+            is CompanionAction.SetAdvertLocation ->
+                byteArrayOf(SET_OTHER_PARAMS, current.manualAddContacts, current.telemetry, if (action.enabled) 1 else 0)
+            is CompanionAction.SetMultiAcks ->
+                byteArrayOf(SET_OTHER_PARAMS, current.manualAddContacts, current.telemetry,
+                    current.advertLocationPolicy, if (action.enabled) 1 else 0)
+        }
+
+    fun pathHashWidth(frame: ByteArray): Int? {
+        if (frame.size < PATH_HASH_INFO_SIZE || frame[0].toInt() != CompanionProtocol.Command.DEVICE_QUERY.expectedReply ||
+            (frame[1].toInt() and 0xff) < PrivateRoute.MULTIBYTE_MIN_VERSION
+        ) return null
+        return frame[81].toInt().takeIf { it in 0..2 }?.plus(1)
+    }
+
+    fun pathHashCommand(bytes: Int): ByteArray? =
+        bytes.takeIf { it in 1..3 }?.let { byteArrayOf(SET_PATH_HASH_MODE, 0, (it - 1).toByte()) }
 
     fun gpsCommand(enabled: Boolean): ByteArray =
         byteArrayOf(SET_CUSTOM_VAR) + (if (enabled) "gps:1" else "gps:0").encodeToByteArray()

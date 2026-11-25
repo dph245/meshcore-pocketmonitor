@@ -23,7 +23,7 @@ import de.meshcore.pocketmonitor.ble.ManagementStatus
 import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 
-private enum class CompanionPanel { SCOPE, CONTACTS, CLI, POSITION, LOCATION_SETTINGS }
+private enum class CompanionPanel { SCOPE, CONTACTS, CLI, POSITION, LOCATION_SETTINGS, RADIO_SETTINGS }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -67,6 +67,9 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
         }
         OutlinedButton(onClick = { panel = CompanionPanel.LOCATION_SETTINGS }, enabled = ready) {
             Text("Standortfreigabe und GPS")
+        }
+        OutlinedButton(onClick = { panel = CompanionPanel.RADIO_SETTINGS }, enabled = status.available) {
+            Text("Funkeinstellungen")
         }
     }
     if (advertPending) Text("Warte auf die Bestätigung des Companion …", style = MaterialTheme.typography.bodySmall)
@@ -112,6 +115,11 @@ internal fun CompanionControls(status: ManagementStatus, contacts: ContactStatus
             onDismiss = { panel = null },
         )
         CompanionPanel.LOCATION_SETTINGS -> CompanionLocationSettingsDialog(
+            status = status,
+            onAction = { action, completed -> model.manageCompanion(status.session, action, completed) },
+            onDismiss = { panel = null },
+        )
+        CompanionPanel.RADIO_SETTINGS -> CompanionRadioSettingsDialog(
             status = status,
             onAction = { action, completed -> model.manageCompanion(status.session, action, completed) },
             onDismiss = { panel = null },
