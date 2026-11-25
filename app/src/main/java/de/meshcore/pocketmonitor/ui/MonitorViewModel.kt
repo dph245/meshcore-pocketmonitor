@@ -19,10 +19,14 @@ import de.meshcore.pocketmonitor.protocol.CompanionAction
 import de.meshcore.pocketmonitor.protocol.RadioChannel
 import de.meshcore.pocketmonitor.protocol.RepeaterSort
 import de.meshcore.pocketmonitor.rx.CompanionHistory
+import de.meshcore.pocketmonitor.rx.DEFAULT_HISTORY_AGE_DAYS
 import de.meshcore.pocketmonitor.rx.HistoryChannel
+import de.meshcore.pocketmonitor.rx.HISTORY_DAY_MS
 import de.meshcore.pocketmonitor.rx.KnownCompanion
 import de.meshcore.pocketmonitor.rx.LegacyJournalImport
 import de.meshcore.pocketmonitor.rx.MessageCursor
+import de.meshcore.pocketmonitor.rx.RADIO_RETENTION_DAYS_KEY
+import de.meshcore.pocketmonitor.rx.radioRetentionRange
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +63,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val historyReady = mutableHistoryReady.asStateFlow()
     private val mutableHistoryCleanup = MutableStateFlow(HistoryCleanupState())
     val historyCleanup = mutableHistoryCleanup.asStateFlow()
+    private val mutableRadioRetentionDays = MutableStateFlow(savedRadioRetentionDays())
+    val radioRetentionDays = mutableRadioRetentionDays.asStateFlow()
     private val mutableRestoreRevision = MutableStateFlow(0)
     val restoreRevision = mutableRestoreRevision.asStateFlow()
     private val mutableScan = MutableStateFlow(ScanState())
@@ -137,8 +143,8 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
         viewModelScope.launch {
             val known = withContext(Dispatchers.IO) {
                 try {
-                    history.prune()
                     LegacyJournalImport(history, File(application.filesDir, "rx")).run(System.currentTimeMillis())
+                    pruneHistory()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -158,7 +164,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
             while (true) {
                 delay(60_000)
                 try {
-                    withContext(Dispatchers.IO) { history.prune() }
+                    withContext(Dispatchers.IO) { pruneHistory() }
                 } catch (e: android.database.sqlite.SQLiteException) {
                     mutableHistoryError.value = "Historie konnte nicht bereinigt werden: ${e.message}"
                 }
@@ -166,11 +172,26 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
+    private fun savedRadioRetentionDays(): Int =
+        livePreferences.getInt(RADIO_RETENTION_DAYS_KEY, DEFAULT_HISTORY_AGE_DAYS)
+
+    private fun pruneHistory() = synchronized(history) {
+        // Read the limit and prune under the same lock used to restore the database and its settings.
+        history.prune(radioRetentionDays = savedRadioRetentionDays())
+    }
+
+    fun setRadioRetentionDays(days: Int) {
+        require(days in radioRetentionRange)
+        livePreferences.edit { putInt(RADIO_RETENTION_DAYS_KEY, days) }
+        mutableRadioRetentionDays.value = days
+    }
+
     suspend fun refreshRestoredHistory() {
         val known = withContext(Dispatchers.IO) { history.knownCompanions() }
         mutableCompanions.value = known
         mutableSelectedCompanion.value = known.firstOrNull()?.id
         mutableHistoryError.value = null
+        mutableRadioRetentionDays.value = savedRadioRetentionDays()
         mutablePrivateOptionsRevision.value++
         mutableRestoreRevision.value++
     }
@@ -185,7 +206,7 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
 
     fun deleteOldMessages(days: Int) {
         if (!historyReady.value || mutableHistoryCleanup.value.running) return
-        val cutoff = System.currentTimeMillis() - days * 86_400_000L
+        val cutoff = System.currentTimeMillis() - days * HISTORY_DAY_MS
         mutableHistoryCleanup.value = HistoryCleanupState(running = true)
         viewModelScope.launch {
             mutableHistoryCleanup.value = try {

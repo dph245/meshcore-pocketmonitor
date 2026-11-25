@@ -5,6 +5,8 @@ import android.content.Context
 import android.net.Uri
 import android.util.AtomicFile
 import de.meshcore.pocketmonitor.rx.CompanionHistory
+import de.meshcore.pocketmonitor.rx.RADIO_RETENTION_DAYS_KEY
+import de.meshcore.pocketmonitor.rx.radioRetentionRange
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.DataInputStream
@@ -175,7 +177,8 @@ internal class AppBackup(private val context: Context, private val history: Comp
 
     private fun validPreference(file: String, key: String, value: Any): Boolean = when (file) {
         "MainActivity" -> key == "keep_screen_on" && value is Boolean
-        "live_preferences" -> value is String
+        "live_preferences" -> if (key == RADIO_RETENTION_DAYS_KEY) value is Int && value in radioRetentionRange
+            else value is String
         "installed_private_routes" -> value is Set<*>
         "tcp_connection" -> when (key) {
             "host" -> value is String

@@ -47,7 +47,11 @@ internal const val PRIVATE_ID_PREFIX = "pm:"
 
 internal const val LIVE_PAGE_SIZE = 500
 internal const val CHAT_PAGE_SIZE = 200
-internal const val HISTORY_AGE_MS = 30L * 24 * 60 * 60 * 1000
+internal const val DEFAULT_HISTORY_AGE_DAYS = 30
+internal const val HISTORY_DAY_MS = 86_400_000L
+internal const val HISTORY_AGE_MS = DEFAULT_HISTORY_AGE_DAYS * HISTORY_DAY_MS
+internal const val RADIO_RETENTION_DAYS_KEY = "radio_retention_days"
+internal val radioRetentionRange = 1..DEFAULT_HISTORY_AGE_DAYS
 
 internal class CompanionHistory(private val helper: HistoryDatabase) {
     private val changes = AtomicLong()
@@ -108,6 +112,7 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         HistoryBackup.open(file).use { HistoryBackup.validate(it, db.version) }
     }
 
+    @Synchronized
     fun restoreDatabase(file: File, restoreId: String, restorePreferences: () -> Unit) {
         val database = db
         HistoryBackup.open(file).use { source ->
@@ -455,15 +460,20 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         return HistoryPage(rows.take(limit).asReversed(), rows.size > limit, unreadThrough)
     }
 
-    fun prune(now: Long = System.currentTimeMillis()) {
+    fun prune(now: Long = System.currentTimeMillis(), radioRetentionDays: Int = DEFAULT_HISTORY_AGE_DAYS) {
+        require(radioRetentionDays in radioRetentionRange)
+        val cutoff = now - HISTORY_AGE_MS
         // Small transactions let ingestion and readers make progress after a long absence.
         val database = db
         database.compileStatement("""
             DELETE FROM rx WHERE id IN (
-                SELECT id FROM rx WHERE received_at < ? ORDER BY received_at LIMIT 2000
+                SELECT id FROM rx
+                WHERE received_at < ? AND (received_at < ? OR code = ${CompanionProtocol.RF_LOG})
+                ORDER BY received_at LIMIT 2000
             )
         """).use { statement ->
-            statement.bindLong(1, now - HISTORY_AGE_MS)
+            statement.bindLong(1, now - radioRetentionDays * HISTORY_DAY_MS)
+            statement.bindLong(2, cutoff)
             while (true) {
                 val deleted = statement.executeUpdateDelete()
                 if (deleted > 0) changes.incrementAndGet()
@@ -471,9 +481,9 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
             }
         }
         val expired = database.delete("message", "id IN (SELECT message_id FROM group_send WHERE created_at < ?)",
-            arrayOf((now - HISTORY_AGE_MS).toString()))
+            arrayOf(cutoff.toString()))
         val expiredPrivate = database.delete("message", "id IN (SELECT message_id FROM private_send WHERE created_at < ?)",
-            arrayOf((now - HISTORY_AGE_MS).toString()))
+            arrayOf(cutoff.toString()))
         if (expired + expiredPrivate > 0) changes.incrementAndGet()
         database.execSQL("""
             DELETE FROM channel WHERE slot IS NULL AND NOT EXISTS (

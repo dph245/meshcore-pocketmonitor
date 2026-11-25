@@ -9,10 +9,12 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -28,10 +30,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import de.meshcore.pocketmonitor.rx.radioRetentionRange
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -49,6 +54,8 @@ internal fun HistoryStorage(model: MonitorViewModel, ready: Boolean, cleanup: Hi
     var sizeRead by remember { mutableStateOf(false) }
     var dialogOpen by rememberSaveable { mutableStateOf(false) }
     var days by rememberSaveable { mutableIntStateOf(14) }
+    val retentionDays by model.radioRetentionDays.collectAsStateWithLifecycle()
+    var retentionInput by rememberSaveable { mutableStateOf<String?>(null) }
 
     LaunchedEffect(model, lifecycle, ready, cleanup.running) {
         if (!ready || cleanup.running) return@LaunchedEffect
@@ -63,6 +70,12 @@ internal fun HistoryStorage(model: MonitorViewModel, ready: Boolean, cleanup: Hi
     val sizeLabel = size?.let { Formatter.formatShortFileSize(context, it) }
         ?: if (sizeRead) "Größe nicht verfügbar" else "Größe wird ermittelt …"
     Text("App-Datenbank · $sizeLabel", style = MaterialTheme.typography.bodyMedium)
+    OutlinedButton(
+        onClick = { retentionInput = retentionDays.toString() },
+        enabled = ready && !cleanup.running,
+    ) {
+        Text(if (retentionDays == 1) "Funkaufbewahrung · 1 Tag" else "Funkaufbewahrung · $retentionDays Tage")
+    }
     OutlinedButton(onClick = { dialogOpen = true }, enabled = ready && !cleanup.running) {
         Text(if (cleanup.running) "Datenbank wird bereinigt …" else "Alte Nachrichten löschen")
     }
@@ -70,6 +83,38 @@ internal fun HistoryStorage(model: MonitorViewModel, ready: Boolean, cleanup: Hi
         Text(
             it, style = MaterialTheme.typography.bodySmall,
             color = if (cleanup.error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+        )
+    }
+    retentionInput?.let { input ->
+        val age = input.toIntOrNull()?.takeIf { it in radioRetentionRange }
+        AlertDialog(
+            onDismissRequest = { retentionInput = null },
+            title = { Text("Maximales Alter der Funkpakete") },
+            text = {
+                Column(
+                    Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("PocketMonitor löscht ältere Funkpakete aller Companions automatisch aus Live-Funk und Roh-RX. Nachrichten, die nur durch solche Funkpakete belegt sind, werden ebenfalls gelöscht.")
+                    OutlinedTextField(
+                        value = input,
+                        onValueChange = { retentionInput = it },
+                        label = { Text("Tage seit Empfang") },
+                        supportingText = { Text("${radioRetentionRange.first}–${radioRetentionRange.last} Tage") },
+                        isError = age == null && input.isNotEmpty(),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = ready && !cleanup.running && age != null && age != retentionDays, onClick = {
+                    if (age != null) model.setRadioRetentionDays(age)
+                    retentionInput = null
+                }) { Text("Speichern") }
+            },
+            dismissButton = { TextButton(onClick = { retentionInput = null }) { Text("Abbrechen") } },
         )
     }
     if (dialogOpen && !cleanup.running) {

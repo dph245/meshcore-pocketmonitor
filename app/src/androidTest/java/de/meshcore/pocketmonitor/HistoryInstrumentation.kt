@@ -27,10 +27,12 @@ import de.meshcore.pocketmonitor.protocol.RadioChannel
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.HISTORY_AGE_MS
+import de.meshcore.pocketmonitor.rx.HISTORY_DAY_MS
 import de.meshcore.pocketmonitor.rx.HistoryDatabase
 import de.meshcore.pocketmonitor.rx.KnownCompanion
 import de.meshcore.pocketmonitor.rx.LegacyJournalImport
 import de.meshcore.pocketmonitor.rx.MessageCursor
+import de.meshcore.pocketmonitor.rx.RADIO_RETENTION_DAYS_KEY
 import de.meshcore.pocketmonitor.rx.Received
 import de.meshcore.pocketmonitor.rx.ReceptionWriter
 import de.meshcore.pocketmonitor.rx.RxFrame
@@ -85,10 +87,11 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyPrivateAttemptMigration()
                 verifyArchiveDeletion()
                 verifyStorageCleanup()
+                verifyRadioRetention()
                 verifyBackupRoundTrip(legacy)
                 verifyCompanionRestoreOverTcp()
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, storage cleanup, deduplication, retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging, encrypted backup restore and simulated TCP setup\n")
+            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, storage cleanup, deduplication, retention, radio retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging, encrypted backup restore and simulated TCP setup\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -118,8 +121,10 @@ class HistoryInstrumentation : Instrumentation() {
                 val password = "synthetisches-testpasswort".toCharArray()
                 val conversation = context.getSharedPreferences("conversation_preferences", Context.MODE_PRIVATE)
                 val routes = context.getSharedPreferences("installed_private_routes", Context.MODE_PRIVATE)
+                val live = context.getSharedPreferences("live_preferences", Context.MODE_PRIVATE)
                 check(conversation.edit().putString("channel_order", "RECENT").commit())
                 check(routes.edit().putStringSet("synthetic-route", setOf("test-hop")).commit())
+                check(live.edit().putInt(RADIO_RETENTION_DAYS_KEY, 7).commit())
                 history.register(id, "Gesichert", now)
                 history.append(id, "test", listOf(Received(1, RxFrame(now, publicFrame))), ChannelDecoding.default)
                 val original = history.messages(id, public.identity, null).rows.single()
@@ -131,6 +136,7 @@ class HistoryInstrumentation : Instrumentation() {
                 history.markAllChannelMessagesRead(id)
                 check(conversation.edit().putString("channel_order", "ALPHABETICAL").commit())
                 check(routes.edit().clear().commit())
+                check(live.edit().clear().commit())
                 val preview = backup.read(Uri.fromFile(export), password) as BackupContents.App
                 preview.use {
                     check(history.knownCompanions().size == 2)
@@ -144,6 +150,7 @@ class HistoryInstrumentation : Instrumentation() {
                 })
                 check(conversation.getString("channel_order", null) == "RECENT")
                 check(routes.getStringSet("synthetic-route", null) == setOf("test-hop"))
+                check(live.getInt(RADIO_RETENTION_DAYS_KEY, 30) == 7)
 
                 // Emulate a process ending after the preferences changed but before SQLite committed.
                 val rollback = JSONObject()
@@ -383,6 +390,48 @@ class HistoryInstrumentation : Instrumentation() {
                 check(history.messages(id, public.identity, null).rows.single().text == "Neuer Text")
                 check(history.deleteMessagesBefore(cutoff).deletedMessages == 0)
                 helper.writableDatabase.rawQuery("PRAGMA foreign_key_check", null).use { check(!it.moveToFirst()) }
+            }
+        } finally {
+            targetContext.deleteDatabase(name)
+        }
+    }
+
+    private fun verifyRadioRetention() {
+        val name = "radio-retention-test-${UUID.randomUUID()}.db"
+        try {
+            HistoryDatabase(targetContext, name).use { helper ->
+                val history = CompanionHistory(helper)
+                val cutoff = now - 7 * HISTORY_DAY_MS
+                val payload = checkNotNull(decodeMessage(RxFrame(cutoff, publicFrame), ChannelDecoding.default)).payload
+                val timestamp = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(payload.timestampSeconds.toInt()).array()
+                val text = payload.sender?.let { "$it: " }.orEmpty() + payload.text
+                val queued = "11e4000004ff00".hexToByteArray() + timestamp + text.encodeToByteArray()
+                history.register(id, "Erster Companion", now)
+                history.register(other, "Zweiter Companion", now)
+                history.append(id, "radio", listOf(
+                    Received(1, RxFrame(cutoff - 1, publicFrame)),
+                    Received(2, RxFrame(cutoff, byteArrayOf(0x88.toByte()))),
+                    Received(3, RxFrame(now - HISTORY_AGE_MS - 1, byteArrayOf(0x00))),
+                ), ChannelDecoding.default)
+                history.append(other, "other-radio", listOf(Received(1, RxFrame(cutoff - 1, publicFrame))), ChannelDecoding.default)
+                history.appendQueued(other, "other-radio", Received(2, RxFrame(cutoff - 1, queued)),
+                    listOf(ChannelSlot(4, public)), emptyMap())
+                check(history.journal(id, null, null, null).count == 3L)
+                check(history.messages(other, public.identity, null).rows.single().receptionCount == 1L)
+                val revision = history.revision
+
+                history.prune(now, radioRetentionDays = 7)
+
+                check(history.revision > revision)
+                check(history.journal(id, null, null, null).newestFirst.single().timeMs == cutoff)
+                check(history.journal(other, null, null, null).let {
+                    it.count == 1L && it.newestRadioFirst.isEmpty() && it.newestFirst.single().frame.bytes.contentEquals(queued)
+                })
+                check(history.messages(id, public.identity, null).rows.isEmpty())
+                check(history.messages(other, public.identity, null).rows.single().let {
+                    it.synchronized && it.receptionCount == 0L
+                })
             }
         } finally {
             targetContext.deleteDatabase(name)
