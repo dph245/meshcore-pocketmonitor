@@ -11,6 +11,8 @@ internal object HistoryBackup {
         "companion", "channel", "message", "rx", "legacy_import", "contact_type",
         "private_send", "group_send", "group_repeat", "group_repeater", "group_scope",
     )
+    private val traceTables = listOf("trace_preset", "trace_series", "trace_measurement")
+    private val allTables = tables + traceTables
 
     fun snapshot(source: SQLiteDatabase, destination: SQLiteDatabase) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
@@ -30,7 +32,7 @@ internal object HistoryBackup {
         SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS)
 
     fun validate(source: SQLiteDatabase, expectedVersion: Int) {
-        check(source.version == expectedVersion) { "Die SQLite-Version dieser Sicherung wird nicht unterstützt." }
+        check(source.version == expectedVersion || (source.version == 10 && expectedVersion == 11)) { "Die SQLite-Version dieser Sicherung wird nicht unterstützt." }
         check(source.rawQuery("PRAGMA quick_check", null).use { it.moveToFirst() && it.getString(0) == "ok" && !it.moveToNext() }) {
             "Die SQLite-Sicherung ist beschädigt."
         }
@@ -39,13 +41,13 @@ internal object HistoryBackup {
         }
         val names = source.rawQuery("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'", null)
             .use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) } }
-        check(names - "android_metadata" == (tables + "backup_state").toSet()) { "Unerwartete Tabellen in der SQLite-Sicherung." }
+        check(names - "android_metadata" == (tablesFor(source) + "backup_state").toSet()) { "Unerwartete Tabellen in der SQLite-Sicherung." }
     }
 
     fun replace(destination: SQLiteDatabase, source: SQLiteDatabase, afterCopy: () -> Unit) {
         destination.inTransaction {
-            for (table in tables.asReversed()) destination.delete(table, null, null)
-            for (table in tables) {
+            for (table in allTables.asReversed()) destination.delete(table, null, null)
+            for (table in tablesFor(source)) {
                 copyTable(source, destination, table)
                 // rx_insert computes this count when the receptions are copied below.
                 if (table == "companion") destination.execSQL("UPDATE companion SET rx_count = 0")
@@ -55,6 +57,8 @@ internal object HistoryBackup {
             afterCopy()
         }
     }
+
+    private fun tablesFor(source: SQLiteDatabase) = if (source.version == 10) tables else allTables
 
     private fun copyTable(source: SQLiteDatabase, destination: SQLiteDatabase, table: String) {
         val columns = destination.rawQuery("SELECT * FROM `$table` LIMIT 0", null).use { it.columnNames }

@@ -22,6 +22,7 @@ internal sealed interface CompanionAction {
     data class SendAdvert(val flood: Boolean) : CompanionAction
     data class SetPosition(val position: CompanionPosition) : CompanionAction
     data object ReadLocationSettings : CompanionAction
+    data object ReadTraceRadio : CompanionAction
     data object ReadRadioSettings : CompanionAction
     sealed interface SetOtherParam : CompanionAction {
         val enabled: Boolean

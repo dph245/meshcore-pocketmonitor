@@ -94,7 +94,6 @@ internal fun MonitorScreen(
     val scan by model.scan.collectAsStateWithLifecycle()
     val connection by model.connectionStatus.collectAsStateWithLifecycle()
     val discover by model.discover.collectAsStateWithLifecycle()
-    val traces by model.traces.collectAsStateWithLifecycle()
     val contacts = connection.contacts
     val companions by model.companions.collectAsStateWithLifecycle()
     val companion by model.selectedCompanion.collectAsStateWithLifecycle()
@@ -326,7 +325,10 @@ internal fun MonitorScreen(
                         )
                     } else {
                         tabState.SaveableStateProvider("trace") {
-                            TraceView(traces, connection.traceSender, contacts.book, model::sendTrace, Modifier.weight(1f))
+                            val traceCompanion = contacts.journalName ?: companion
+                            key(traceCompanion) {
+                                TraceView(model, traceCompanion, connection.traceSender, contacts.book, Modifier.weight(1f))
+                            }
                         }
                     }
                 }

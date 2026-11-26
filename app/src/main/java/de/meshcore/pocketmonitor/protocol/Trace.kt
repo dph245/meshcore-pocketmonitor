@@ -94,7 +94,7 @@ internal class TraceCommand(path: TracePath, private val tag: UInt, auth: UInt) 
     }
 }
 
-internal enum class TracePhase { CONFIRMING, LISTENING, ANSWERED, TIMED_OUT, FAILED, DISCONNECTED }
+internal enum class TracePhase { CONFIRMING, LISTENING, ANSWERED, TIMED_OUT, FAILED, DISCONNECTED, CANCELLED }
 
 internal data class TraceRun(
     val session: String,
@@ -107,6 +107,12 @@ internal data class TraceRun(
     val response: TraceResponse? = null,
     val message: String? = null,
     val late: Boolean = false,
+    val startedElapsedMs: Long = 0,
+    val responseMs: Long? = null,
+    val accepted: Boolean = false,
+    val responseTimeoutMs: Long? = null,
+    val firmwareWindowEndMs: Long = 0,
+    val companion: String? = null,
 ) {
     val busy: Boolean get() = phase == TracePhase.CONFIRMING || phase == TracePhase.LISTENING
 

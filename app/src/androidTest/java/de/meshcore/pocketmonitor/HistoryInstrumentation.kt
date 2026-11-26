@@ -24,6 +24,10 @@ import de.meshcore.pocketmonitor.protocol.CompanionContact
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import de.meshcore.pocketmonitor.protocol.RadioChannel
+import de.meshcore.pocketmonitor.protocol.TraceRadio
+import de.meshcore.pocketmonitor.protocol.TraceRoute
+import de.meshcore.pocketmonitor.protocol.TraceSeriesOptions
+import de.meshcore.pocketmonitor.protocol.TraceSeriesStatus
 import de.meshcore.pocketmonitor.rx.CHAT_PAGE_SIZE
 import de.meshcore.pocketmonitor.rx.CompanionHistory
 import de.meshcore.pocketmonitor.rx.HISTORY_AGE_MS
@@ -61,7 +65,10 @@ class HistoryInstrumentation : Instrumentation() {
     private val other = "bb".repeat(32)
     private val now = 1_800_000_000_000L
 
+    private var traceBle = false
+
     override fun onCreate(arguments: Bundle?) {
+        traceBle = arguments?.getString("traceBle") == "true"
         super.onCreate(arguments)
         start()
     }
@@ -72,6 +79,10 @@ class HistoryInstrumentation : Instrumentation() {
         val result = Bundle()
         val code = try {
             runBlocking {
+                if (traceBle) {
+                    TraceInstrumentation(targetContext).verifyBleLoss()
+                    return@runBlocking
+                }
                 HistoryDatabase(targetContext, name).use { db ->
                     verifyWriteAndPaging(CompanionHistory(db))
                 }
@@ -90,8 +101,14 @@ class HistoryInstrumentation : Instrumentation() {
                 verifyRadioRetention()
                 verifyBackupRoundTrip(legacy)
                 verifyCompanionRestoreOverTcp()
+                TraceInstrumentation(targetContext).apply {
+                    verifyPresetsAndMigration(legacy)
+                    verifySession()
+                }
             }
-            result.putString("stream", "\nPASS: SQLite reopen, companion isolation, slots, archive deletion, storage cleanup, deduplication, retention, radio retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging, encrypted backup restore and simulated TCP setup\n")
+            val checks = if (traceBle) "Simulated BLE GATT disconnect, persistence and no TRACE resumption on reconnect"
+            else "SQLite reopen, companion isolation, slots, archive deletion, storage cleanup, deduplication, retention, radio retention, legacy import, queue synchronization, bulk channel read, private RX and TX, group send, repeats, migration, paging, encrypted backup restore, simulated TCP setup, TRACE presets, migration and simulated TRACE series"
+            result.putString("stream", "\nPASS: $checks\n")
             Activity.RESULT_OK
         } catch (e: Throwable) {
             result.putString("stream", "\n${e.stackTraceToString()}\n")
@@ -130,8 +147,15 @@ class HistoryInstrumentation : Instrumentation() {
                 val original = history.messages(id, public.identity, null).rows.single()
                 val unread = history.unreadConversations()
                 check(unread.isNotEmpty())
+                val route = TraceRoute(1, listOf("AA", "BB"), true)
+                val preset = history.traceHistory.savePreset(id, null, "Gesicherte Strecke", route)
+                val range = TraceSeriesOptions(1)
+                val series = history.traceHistory.beginSeries(id, "Gesicherte Strecke", route, range, now,
+                    TraceRadio(sf = 7))
+                history.traceHistory.finishSeries(series, TraceSeriesStatus.COMPLETED, null)
                 backup.writeApp(Uri.fromFile(export), password)
 
+                history.traceHistory.deletePreset(id, preset)
                 history.register(other, "Später", now)
                 history.markAllChannelMessagesRead(id)
                 check(conversation.edit().putString("channel_order", "ALPHABETICAL").commit())
@@ -144,6 +168,8 @@ class HistoryInstrumentation : Instrumentation() {
                 }
                 check(history.knownCompanions() == listOf(KnownCompanion(id, "Gesichert")))
                 check(history.unreadConversations() == unread)
+                check(history.traceHistory.presets(id).single().route == route)
+                check(history.traceHistory.series(id, Long.MAX_VALUE, 1).single().radio.sf == 7)
                 check(history.messages(id, public.identity, null).rows.single() == original)
                 check(history.journal(id, null, null, null).let {
                     it.count == 1L && it.newestFirst.single().frame.bytes.contentEquals(publicFrame)
@@ -649,6 +675,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("ALTER TABLE private_send DROP COLUMN last_route")
                 db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
                 db.execSQL("DROP TABLE backup_state")
+                dropTraceTables(db)
                 db.version = 7
             }
             HistoryDatabase(targetContext, file).use { helper ->
@@ -728,6 +755,7 @@ class HistoryInstrumentation : Instrumentation() {
                 db.execSQL("ALTER TABLE companion DROP COLUMN group_scope_dirty")
                 db.execSQL("ALTER TABLE rx DROP COLUMN message_discarded")
                 db.execSQL("DROP TABLE backup_state")
+                dropTraceTables(db)
                 db.version = 2
             }
             val firstId = HistoryDatabase(targetContext, file).use { helper ->

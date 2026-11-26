@@ -61,6 +61,12 @@ import de.meshcore.pocketmonitor.protocol.TracePath
 import de.meshcore.pocketmonitor.protocol.TracePhase
 import de.meshcore.pocketmonitor.protocol.TraceResponse
 import de.meshcore.pocketmonitor.protocol.TraceRun
+import de.meshcore.pocketmonitor.protocol.TraceRadio
+import de.meshcore.pocketmonitor.protocol.TraceRoute
+import de.meshcore.pocketmonitor.protocol.TraceSchedule
+import de.meshcore.pocketmonitor.protocol.TraceSeriesOptions
+import de.meshcore.pocketmonitor.protocol.TraceSeriesProgress
+import de.meshcore.pocketmonitor.protocol.TraceSeriesStatus
 import de.meshcore.pocketmonitor.rx.RxFrame
 import de.meshcore.pocketmonitor.rx.isJournalable
 import de.meshcore.pocketmonitor.rx.CompanionHistory
@@ -72,7 +78,16 @@ import de.meshcore.pocketmonitor.tcp.CompanionTcpTransport
 import de.meshcore.pocketmonitor.tcp.TcpEndpoint
 import java.util.UUID
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -243,6 +258,9 @@ internal class CompanionConnection(private val context: Context, private val his
     }
     private val mutableTraces = MutableStateFlow<List<TraceRun>>(emptyList())
     val traces = mutableTraces.asStateFlow()
+    private val mutableTraceSeries = MutableStateFlow<TraceSeriesProgress?>(null)
+    val traceSeries = mutableTraceSeries.asStateFlow()
+    private var traceSeriesJob: Job? = null
 
     private val mutableCompanion = MutableStateFlow<KnownCompanion?>(null)
     val companion = mutableCompanion.asStateFlow()
@@ -264,6 +282,7 @@ internal class CompanionConnection(private val context: Context, private val his
         check(target == null && !restoringHistory) { "Für die App-Wiederherstellung zuerst den Companion trennen." }
         restoringHistory = true
         try {
+            traceSeriesJob?.join()
             previousWriter?.join()
             withContext(Dispatchers.Main) { block() }
         } finally {
@@ -404,6 +423,14 @@ internal class CompanionConnection(private val context: Context, private val his
         handler.post { current?.sendTrace(session, path) }
     }
 
+    fun startTraceSeries(session: String, route: TraceRoute, name: String?, options: TraceSeriesOptions) {
+        handler.post { current?.startTraceSeries(session, route, name, options) }
+    }
+
+    fun cancelTraceSeries() {
+        handler.post { current?.cancelTraceSeries() }
+    }
+
     fun sendDiscover() {
         handler.post { current?.sendDiscover() }
     }
@@ -498,6 +525,14 @@ internal class CompanionConnection(private val context: Context, private val his
         private var discoverReply: DiscoverCommandReply? = null
         private var traceCommand: TraceCommand? = null
         private var traceTimer: Runnable? = null
+        private var traceGuard: Runnable? = null
+        private var traceHoldUntil = 0L
+        private var traceDeadline = 0L
+        private var traceTag = Random.nextInt().toUInt()
+        private var cancelledTrace: UInt? = null
+        private var traceRadio = TraceRadio()
+        private var traceRadioRead = TraceRadio()
+        private var traceDisconnect: String? = null
         private var discoverDisabled: String? = null
         private var commandChannelUncertain = false
         private var timeout: Runnable? = null
@@ -859,6 +894,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 if (transaction.command == Command.DEVICE_QUERY && frame.code == Command.DEVICE_QUERY.expectedReply) {
                     val version = frame.bytes.getOrNull(1)?.toInt()?.and(0xff) ?: 0
                     firmwareVersion = version
+                    traceRadio = TraceRadio.fromDeviceInfo(frame.bytes)
                     pathHashWidth = CompanionManagement.pathHashWidth(frame.bytes)
                     if (version >= 3 && mtu >= ChannelQuery.CHANNEL_MTU) {
                         channelSlots = frame.bytes.getOrNull(3)?.toInt()?.and(0xff) ?: 0
@@ -1530,7 +1566,7 @@ internal class CompanionConnection(private val context: Context, private val his
                 is CompanionAction.SendAdvert -> CompanionManagement.advertCommand(action.flood)
                 CompanionAction.Reboot -> CompanionManagement.rebootCommand()
                 is CompanionAction.SetPosition -> CompanionManagement.positionCommand(action.position)
-                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings,
+                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings, CompanionAction.ReadTraceRadio,
                 is CompanionAction.SetOtherParam -> Command.APP_START.encode()
                 is CompanionAction.SetPathHashWidth -> CompanionManagement.pathHashCommand(action.bytes)
                 is CompanionAction.SetGpsEnabled -> CompanionManagement.gpsCommand(action.enabled)
@@ -1557,7 +1593,7 @@ internal class CompanionConnection(private val context: Context, private val his
             when (action) {
                 is CompanionAction.AddContact, is CompanionAction.RemoveContact ->
                     prepareContactChange(action, command)
-                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings,
+                CompanionAction.ReadLocationSettings, CompanionAction.ReadRadioSettings, CompanionAction.ReadTraceRadio,
                 is CompanionAction.SetOtherParam -> {
                     otherParams = null
                     if (action == CompanionAction.ReadLocationSettings) gps = CompanionGps.UNKNOWN
@@ -1674,6 +1710,15 @@ internal class CompanionConnection(private val context: Context, private val his
                             otherParams == null -> "Standortfreigabe konnte nicht gelesen werden."
                             else -> null
                         })
+                    }
+                }
+                CompanionAction.ReadTraceRadio -> {
+                    val identity = CompanionProtocol.selfIdentity(frame)
+                    if (identity != null && identity != journalName) {
+                        finishManagement(error = "Der Companion meldet eine andere Identität.", uncertain = true)
+                    } else {
+                        traceRadioRead = traceRadio.withSelfInfo(frame, checkNotNull(journalName))
+                        finishManagement()
                     }
                 }
                 CompanionAction.ReadRadioSettings -> {
@@ -2321,6 +2366,7 @@ internal class CompanionConnection(private val context: Context, private val his
         private fun traceSender() = TraceSender(discoverSession, mtu, when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Erneut verbinden."
             mtu < 18 -> "BLE-MTU für TRACE zu klein."
+            SystemClock.elapsedRealtime() < traceHoldUntil -> "Das TRACE-Funkzeitfenster läuft noch."
             commandBusy() || privateTx != null -> "Bitte den laufenden Companion-Vorgang abwarten."
             else -> null
         })
@@ -2334,24 +2380,28 @@ internal class CompanionConnection(private val context: Context, private val his
             }
         }
 
-        fun sendTrace(session: String, path: TracePath) = guarded {
-            if (!transportReady) return@guarded
-            val identity = journalName ?: return@guarded
-            if (!mutableStatus.value.active || session != discoverSession || traceSender().unavailable != null ||
-                activeTrace() != null || path.hashes.size > TracePath.maxHops(path.hashBytes, mtu)
-            ) return@guarded
+        private fun traceReady(path: TracePath): Boolean =
+            transportReady && mutableStatus.value.active && traceSender().unavailable == null &&
+                activeTrace() == null && path.hashes.size <= TracePath.maxHops(path.hashBytes, mtu)
 
-            val runs = mutableTraces.value
-            var tag = Random.nextInt().toUInt()
-            while (runs.any { it.tag == tag }) tag = Random.nextInt().toUInt()
-            val auth = Random.nextInt().toUInt()
-            val run = TraceRun(
-                discoverSession, tag, auth, path, System.currentTimeMillis(),
-                mutableStatus.value.contacts.resolverFor(identity),
-            )
-            val command = TraceCommand(path, tag, auth)
+        fun sendTrace(session: String, path: TracePath) = guarded {
+            if (session != discoverSession || traceSeriesJob != null || !traceReady(path)) return@guarded
+            writeTrace(newTrace(path))
+        }
+
+        private fun newTrace(path: TracePath, responseTimeoutMs: Long? = null) = TraceRun(
+            discoverSession, traceTag++, Random.nextInt().toUInt(), path, System.currentTimeMillis(),
+            mutableStatus.value.contacts.resolverFor(checkNotNull(journalName)),
+            responseTimeoutMs = responseTimeoutMs,
+            companion = journalName,
+        )
+
+        private fun writeTrace(prepared: TraceRun) = guarded {
+            val run = prepared.copy(startedAtMs = System.currentTimeMillis(), startedElapsedMs = SystemClock.elapsedRealtime())
+            val manual = mutableTraces.value.filter { it.responseTimeoutMs == null }
+            val command = TraceCommand(run.path, run.tag, run.auth)
             traceCommand = command
-            mutableTraces.value = (runs + run).takeLast(20)
+            mutableTraces.value = if (run.responseTimeoutMs == null) (manual + run).takeLast(20) else manual + run
             publishCommandState()
             timeout = Runnable {
                 finishTraceCommand("Zeitüberschreitung bei der Companion-Bestätigung. Sendestatus unklar.", uncertain = true)
@@ -2379,16 +2429,20 @@ internal class CompanionConnection(private val context: Context, private val his
 
             clearTimeout()
             traceCommand = null
-            if (run.response != null) {
-                updateTrace(run.copy(phase = TracePhase.ANSWERED))
+            val now = SystemClock.elapsedRealtime()
+            val firmwareWait = (estimate + 2_000).coerceIn(5_000, 10 * 60_000)
+            val accepted = run.copy(accepted = true, firmwareWindowEndMs = now + firmwareWait)
+            if (cancelledTrace == run.tag) {
+                cancelledTrace = null
+                holdTraceUntil(accepted.firmwareWindowEndMs)
+                updateTrace(accepted.copy(phase = TracePhase.CANCELLED, response = null, responseMs = null))
+            } else if (run.response != null) {
+                updateTrace(accepted.copy(phase = TracePhase.ANSWERED))
             } else {
-                updateTrace(run.copy(phase = TracePhase.LISTENING))
-                traceTimer = Runnable {
-                    traceTimer = null
-                    activeTrace()?.takeIf { it.tag == run.tag }?.let {
-                        updateTrace(it.copy(phase = TracePhase.TIMED_OUT))
-                    }
-                }.also { handler.postDelayed(it, (estimate + 2_000).coerceIn(5_000, 10 * 60_000)) }
+                val wait = run.responseTimeoutMs ?: firmwareWait
+                traceDeadline = now + wait
+                updateTrace(accepted.copy(phase = TracePhase.LISTENING))
+                traceTimer = Runnable { timeoutTrace(run.tag) }.also { handler.postDelayed(it, wait) }
             }
             publishCommandState()
             handler.post(resumeMessageSync)
@@ -2399,10 +2453,15 @@ internal class CompanionConnection(private val context: Context, private val his
             traceCommand = null
             activeTrace()?.let { run ->
                 updateTrace(run.copy(
-                    phase = if (run.response == null) TracePhase.FAILED else TracePhase.ANSWERED,
+                    phase = when {
+                        cancelledTrace == run.tag -> TracePhase.CANCELLED
+                        run.response != null -> TracePhase.ANSWERED
+                        else -> TracePhase.FAILED
+                    },
                     message = message,
                 ))
             }
+            cancelledTrace = null
             if (uncertain) commandChannelUncertain = true
             val contacts = mutableStatus.value.contacts
             publishCommandState(if (uncertain) contacts.copy(
@@ -2416,18 +2475,192 @@ internal class CompanionConnection(private val context: Context, private val his
             val run = mutableTraces.value.lastOrNull {
                 it.session == discoverSession && it.tag == response.tag
             } ?: return
-            if (run.response != null || !run.matches(response)) return
+            if (cancelledTrace == run.tag || run.response != null || !run.matches(response)) return
+            val now = SystemClock.elapsedRealtime()
+            val answered = run.copy(response = response, responseMs = now - run.startedElapsedMs)
             when (run.phase) {
-                TracePhase.CONFIRMING -> updateTrace(run.copy(response = response))
+                TracePhase.CONFIRMING -> updateTrace(answered)
                 TracePhase.LISTENING -> {
-                    traceTimer?.let(handler::removeCallbacks)
-                    traceTimer = null
-                    updateTrace(run.copy(phase = TracePhase.ANSWERED, response = response))
+                    if (run.responseTimeoutMs != null && now >= traceDeadline) {
+                        timeoutTrace(run.tag)
+                        return
+                    }
+                    clearTraceTimer()
+                    updateTrace(answered.copy(phase = TracePhase.ANSWERED))
                 }
-                TracePhase.TIMED_OUT -> updateTrace(run.copy(phase = TracePhase.ANSWERED, response = response, late = true))
+                TracePhase.TIMED_OUT -> if (run.responseTimeoutMs == null) {
+                    updateTrace(answered.copy(phase = TracePhase.ANSWERED, late = true))
+                }
                 else -> Unit
             }
         }
+
+        private fun clearTraceTimer() {
+            traceTimer?.let(handler::removeCallbacks)
+            traceTimer = null
+        }
+
+        private fun timeoutTrace(tag: UInt) {
+            clearTraceTimer()
+            val run = activeTrace()?.takeIf { it.tag == tag } ?: return
+            if (run.responseTimeoutMs != null) holdTraceUntil(run.firmwareWindowEndMs)
+            updateTrace(run.copy(phase = TracePhase.TIMED_OUT))
+        }
+
+        private fun holdTraceUntil(elapsed: Long) {
+            val wait = elapsed - SystemClock.elapsedRealtime()
+            if (wait <= 0) return
+            traceHoldUntil = elapsed
+            traceGuard?.let(handler::removeCallbacks)
+            traceGuard = Runnable {
+                traceGuard = null
+                if (current === this) publishCommandState()
+            }.also { handler.postDelayed(it, wait) }
+            publishCommandState()
+        }
+
+        private fun abandonTrace(run: TraceRun, message: String): TraceRun {
+            val cancelled = run.copy(phase = TracePhase.CANCELLED, message = message, response = null, responseMs = null)
+            if (activeTrace()?.tag != run.tag) return cancelled
+            if (traceCommand != null) {
+                // Drain the serialized write and reply before another command can start.
+                cancelledTrace = run.tag
+            } else {
+                clearTraceTimer()
+                holdTraceUntil(run.firmwareWindowEndMs)
+                updateTrace(cancelled)
+            }
+            return cancelled
+        }
+
+        fun startTraceSeries(session: String, route: TraceRoute, name: String?, options: TraceSeriesOptions) = guarded {
+            val identity = journalName ?: return@guarded
+            val path = route.path ?: return@guarded
+            if (session != discoverSession || traceSeriesJob != null || !transportReady ||
+                commandChannelUncertain || activeTrace() != null || path.hashes.size > TracePath.maxHops(path.hashBytes, mtu)
+            ) return@guarded
+            traceDisconnect = null
+            mutableTraceSeries.value = TraceSeriesProgress(identity, options.count)
+            traceSeriesJob = CoroutineScope(setupDispatcher).launch(start = CoroutineStart.UNDISPATCHED) {
+                runTraceSeries(identity, route, path, name, options)
+            }
+        }
+
+        fun cancelTraceSeries() {
+            val job = traceSeriesJob ?: return
+            val message = "Messreihe abgebrochen."
+            mutableTraceSeries.value = mutableTraceSeries.value?.copy(message = message)
+            activeTrace()?.takeIf { it.responseTimeoutMs != null }?.let { abandonTrace(it, message) }
+            job.cancel(CancellationException(message))
+        }
+
+        private suspend fun runTraceSeries(
+            identity: String, route: TraceRoute, path: TracePath, name: String?, options: TraceSeriesOptions,
+        ) {
+            val store = history.traceHistory
+            val startedAt = System.currentTimeMillis()
+            var series: Long? = null
+            var number = 0
+            var pendingRun: TraceRun? = null
+            var status = TraceSeriesStatus.COMPLETED
+            var message: String? = null
+            try {
+                val device = traceRadio
+                withContext(NonCancellable) {
+                    series = withContext(Dispatchers.IO) {
+                        store.beginSeries(identity, name, route, options, startedAt, device)
+                    }
+                }
+                val id = checkNotNull(series)
+                mutableTraceSeries.value = mutableTraceSeries.value?.copy(seriesId = id)
+                awaitTraceReady(path)
+                traceRadioRead = device
+                val read = CompletableDeferred<Unit>()
+                manage(discoverSession, CompanionAction.ReadTraceRadio) { read.complete(Unit) }
+                read.await()
+                val radio = traceRadioRead
+                withContext(Dispatchers.IO) { store.saveRadio(id, radio) }
+                for (index in 1..options.count) {
+                    awaitTraceReady(path)
+                    val prepared = newTrace(path, options.timeoutSeconds * 1_000L)
+                    withContext(NonCancellable) {
+                        withContext(Dispatchers.IO) { store.beginMeasurement(id, index, prepared) }
+                        number = index
+                        pendingRun = prepared
+                    }
+                    awaitTraceReady(path)
+                    mutableTraceSeries.value = TraceSeriesProgress(identity, options.count, number, seriesId = id)
+                    writeTrace(prepared)
+                    val first = awaitTraceChange(prepared) { it.phase != TracePhase.CONFIRMING }
+                    if (first.busy) withContext(Dispatchers.IO) { store.saveMeasurement(id, index, first) }
+                    val result = if (first.busy) awaitTraceChange(prepared) { !it.busy } else first
+                    withContext(NonCancellable) {
+                        withContext(Dispatchers.IO) { store.saveMeasurement(id, index, result) }
+                        pendingRun = null
+                    }
+                    if (commandChannelUncertain || !TraceSchedule.continuesAfter(result.phase)) {
+                        status = TraceSeriesStatus.FAILED
+                        message = result.message ?: "Companion-Befehlsstatus unklar. Erneut verbinden."
+                        break
+                    }
+                    if (index < options.count) {
+                        delay(TraceSchedule.nextStartMs(result.startedElapsedMs, options.intervalSeconds * 1_000L,
+                            result.phase, result.firmwareWindowEndMs) - SystemClock.elapsedRealtime())
+                    }
+                }
+            } catch (error: CancellationException) {
+                status = if (traceDisconnect == null) TraceSeriesStatus.ABORTED else TraceSeriesStatus.DISCONNECTED
+                message = traceDisconnect ?: error.message ?: "Messreihe abgebrochen."
+            } catch (error: IllegalStateException) {
+                status = TraceSeriesStatus.FAILED
+                message = error.message
+            } catch (_: SQLiteException) {
+                status = TraceSeriesStatus.FAILED
+                message = "TRACE-Messreihe konnte nicht gespeichert werden."
+            } finally {
+                try {
+                    withContext(NonCancellable) {
+                        val pending = pendingRun?.let { prepared ->
+                            val latest = mutableTraces.value.lastOrNull {
+                                it.session == prepared.session && it.tag == prepared.tag
+                            }
+                            if (latest != null && !latest.busy) latest
+                            else {
+                                val stopped = abandonTrace(latest ?: prepared, message ?: "Messreihe unterbrochen.")
+                                if (cancelledTrace == stopped.tag && current === this@Session) {
+                                    val settled = awaitTraceChange(stopped) { !it.busy }
+                                    stopped.copy(accepted = settled.accepted)
+                                } else stopped
+                            }
+                        }
+                        series?.let { id ->
+                            withContext(Dispatchers.IO) {
+                                pending?.let { store.saveMeasurement(id, number, it) }
+                                store.finishSeries(id, status, message)
+                            }
+                        }
+                    }
+                } catch (_: SQLiteException) {
+                    message = "TRACE-Messreihe konnte nicht gespeichert werden."
+                } finally {
+                    traceSeriesJob = null
+                    mutableTraceSeries.value = TraceSeriesProgress(identity, options.count, number, false, message, series)
+                }
+            }
+        }
+
+        private suspend fun awaitTraceReady(path: TracePath) {
+            coroutineContext.ensureActive()
+            mutableStatus.first {
+                check(current === this && !commandChannelUncertain) { "Companion-Befehlsstatus unklar. Erneut verbinden." }
+                traceReady(path)
+            }
+        }
+
+        private suspend fun awaitTraceChange(run: TraceRun, predicate: (TraceRun) -> Boolean): TraceRun =
+            mutableTraces.first { runs -> runs.lastOrNull()?.let {
+                it.tag == run.tag && it.session == run.session && predicate(it)
+            } == true }.last()
 
         private fun discoverUnavailable(): String? = when {
             commandChannelUncertain -> "Companion-Befehlsstatus unklar. Für DISCOVER erneut verbinden."
@@ -2609,7 +2842,10 @@ internal class CompanionConnection(private val context: Context, private val his
             handler.removeCallbacks(resumeMessageSync)
             clearTimeout()
             searches.disconnect(discoverSession, message)
-            traceTimer?.let(handler::removeCallbacks)
+            clearTraceTimer()
+            traceGuard?.let(handler::removeCallbacks)
+            traceDisconnect = message
+            traceSeriesJob?.cancel(CancellationException(message))
             activeTrace()?.let { run ->
                 updateTrace(run.copy(
                     phase = if (run.response == null) TracePhase.DISCONNECTED else TracePhase.ANSWERED,

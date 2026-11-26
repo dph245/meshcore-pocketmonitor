@@ -8,6 +8,8 @@ import de.meshcore.pocketmonitor.CompanionReceiveService
 import de.meshcore.pocketmonitor.PocketMonitorApplication
 import de.meshcore.pocketmonitor.protocol.PrivateRetryOptions
 import de.meshcore.pocketmonitor.protocol.TracePath
+import de.meshcore.pocketmonitor.protocol.TraceRoute
+import de.meshcore.pocketmonitor.protocol.TraceSeriesOptions
 import de.meshcore.pocketmonitor.protocol.PrivateRoute
 import de.meshcore.pocketmonitor.protocol.CompanionManagement
 import de.meshcore.pocketmonitor.protocol.GroupSend
@@ -78,6 +80,13 @@ internal class MonitorViewModel(application: Application) : AndroidViewModel(app
     val tcpError = mutableTcpError.asStateFlow()
     val discover = connection.discover
     val traces = connection.traces
+    val traceSeries = connection.traceSeries
+    val traceHistory = history.traceHistory
+
+    fun startTraceSeries(session: String, route: TraceRoute, name: String?, options: TraceSeriesOptions) =
+        connection.startTraceSeries(session, route, name, options)
+
+    fun cancelTraceSeries() = connection.cancelTraceSeries()
     val groupSender = connection.groupSender
     val privateSender = connection.privateSender
     val privatePath = connection.privatePath

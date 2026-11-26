@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import de.meshcore.pocketmonitor.protocol.CompanionContact
 
 internal class HistoryDatabase(context: Context, name: String = "companion-history.db") :
-    SQLiteOpenHelper(context, name, null, 10) {
+    SQLiteOpenHelper(context, name, null, 11) {
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -69,6 +69,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         createContactTypes(db)
         db.execSQL("CREATE TABLE legacy_import (session TEXT PRIMARY KEY NOT NULL, ordinal INTEGER NOT NULL)")
         createBackupState(db)
+        createTraceTables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -91,6 +92,37 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         if (oldVersion < 8) addPrivateSendProgress(db)
         if (oldVersion < 9) db.execSQL("ALTER TABLE rx ADD COLUMN message_discarded INTEGER NOT NULL DEFAULT 0")
         if (oldVersion < 10) createBackupState(db)
+        if (oldVersion < 11) createTraceTables(db)
+    }
+
+    private fun createTraceTables(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE trace_preset (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, companion TEXT NOT NULL, name TEXT NOT NULL,
+                width INTEGER NOT NULL, entries TEXT NOT NULL, mirror INTEGER NOT NULL, turn INTEGER
+            )
+        """)
+        db.execSQL("CREATE INDEX trace_preset_companion ON trace_preset(companion, name COLLATE NOCASE, id)")
+        db.execSQL("""
+            CREATE TABLE trace_series (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, companion TEXT NOT NULL, name TEXT,
+                width INTEGER NOT NULL, entries TEXT NOT NULL, mirror INTEGER NOT NULL, turn INTEGER,
+                requested INTEGER NOT NULL, interval_seconds INTEGER NOT NULL, timeout_seconds INTEGER NOT NULL,
+                started_at INTEGER NOT NULL, status TEXT NOT NULL, message TEXT,
+                freq_khz INTEGER, bw_hz INTEGER, sf INTEGER, cr INTEGER, power_dbm INTEGER,
+                firmware TEXT, protocol INTEGER, radio_ic TEXT
+            )
+        """)
+        db.execSQL("CREATE INDEX trace_series_companion ON trace_series(companion, id DESC)")
+        db.execSQL("""
+            CREATE TABLE trace_measurement (
+                series_id INTEGER NOT NULL REFERENCES trace_series(id) ON DELETE CASCADE,
+                number INTEGER NOT NULL, started_at INTEGER NOT NULL, phase TEXT NOT NULL,
+                tag INTEGER NOT NULL, auth INTEGER NOT NULL,
+                accepted INTEGER NOT NULL DEFAULT 0, response_ms INTEGER, snr TEXT, message TEXT,
+                PRIMARY KEY (series_id, number)
+            )
+        """)
     }
 
     private fun createBackupState(db: SQLiteDatabase) {
@@ -124,6 +156,7 @@ internal class HistoryDatabase(context: Context, name: String = "companion-histo
         db.execSQL("""
             UPDATE private_send SET status = 'UNKNOWN' WHERE status IN ('WAITING', 'ACCEPTED')
         """)
+        TraceHistory.interruptRunning(db)
     }
 
     private fun createPrivateSendTable(db: SQLiteDatabase) {

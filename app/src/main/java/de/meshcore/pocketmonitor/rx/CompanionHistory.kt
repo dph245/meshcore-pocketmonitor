@@ -60,6 +60,8 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
     val revision: Long get() = changes.get()
     private val db: SQLiteDatabase get() = helper.writableDatabase
 
+    val traceHistory = TraceHistory(helper)
+
     fun databaseSizeBytes(): Long {
         val path = db.path
         return File(path).length() + File("$path-wal").length() + File("$path-shm").length()
@@ -118,11 +120,13 @@ internal class CompanionHistory(private val helper: HistoryDatabase) {
         HistoryBackup.open(file).use { source ->
             HistoryBackup.replace(database, source) {
                 database.execSQL("UPDATE private_send SET status = 'UNKNOWN' WHERE status IN ('WAITING', 'ACCEPTED')")
+                TraceHistory.interruptRunning(database)
                 database.delete("backup_state", null, null)
                 database.execSQL("INSERT INTO backup_state VALUES (?)", arrayOf(restoreId))
                 restorePreferences()
             }
         }
+        traceHistory.restored()
         configChanges.incrementAndGet()
         changes.incrementAndGet()
     }
